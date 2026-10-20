@@ -1,0 +1,47 @@
+name: authpass
+
+on:
+  workflow_dispatch:
+    inputs:
+      shard_offset:
+        description: 'starting shard index offset'
+        required: false
+        default: '0'
+      workers:
+        description: 'concurrency per shard'
+        required: false
+        default: '48'
+
+jobs:
+  auth:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [0,1,2,3,4,5,6,7,8,9]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install deps
+        run: pip install -q aiohttp
+      - name: Authenticity pass shard ${{ matrix.slot }}
+        run: |
+          SHARD_ID=$(( ${{ github.event.inputs.shard_offset || 0 }} + ${{ matrix.slot }} ))
+          F="data/authpass/auth_${SHARD_ID}.jsonl"
+          if [ ! -f "$F" ]; then
+            echo "no shard $F"
+            echo "[]" > "validated_auth_${SHARD_ID}.json"
+            exit 0
+          fi
+          echo "auth shard ${SHARD_ID}: $(wc -l < $F) hosts"
+          python3 authenticity_pass.py --hosts "$F" \
+            --workers ${{ github.event.inputs.workers || 48 }} \
+            --timeout 8 \
+            -o "validated_auth_${SHARD_ID}.json" || true
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: authpass-${{ matrix.slot }}
+          path: validated_auth_*.json
