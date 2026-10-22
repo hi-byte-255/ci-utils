@@ -29,9 +29,11 @@ jobs:
         uses: actions/checkout@v4
       - name: Install scan and validation tools
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq masscan
-          pip install -q aiohttp
+          sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* 2>/dev/null || true
+          for i in 1 2 3; do sudo apt-get update -qq && break || sleep 5; done
+          for i in 1 2 3; do sudo apt-get install -y -qq masscan && break || sleep 5; done
+          python3 -m pip install -q aiohttp || pip install -q aiohttp
+          masscan --version | head -2
       - name: Run shard ${{ matrix.slot }} (Scan -> Filter Middleboxes -> Validate)
         run: |
           SHARD_ID=$(( ${{ github.event.inputs.shard_offset || 0 }} + ${{ matrix.slot }} ))
