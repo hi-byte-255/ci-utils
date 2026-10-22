@@ -1,26 +1,7 @@
-{"host": "121.190.137.188:1234", "ip": "121.190.137.188", "port": 1234, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "34.194.79.213:8008", "ip": "34.194.79.213", "port": 8008, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "61.149.13.27:8082", "ip": "61.149.13.27", "port": 8082, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "210.90.166.225:1234", "ip": "210.90.166.225", "port": 1234, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "34.196.113.253:4000", "ip": "34.196.113.253", "port": 4000, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "34.196.168.59:8000", "ip": "34.196.168.59", "port": 8000, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "34.197.125.83:8080", "ip": "34.197.125.83", "port": 8080, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "47.242.241.181:3000", "ip": "47.242.241.181", "port": 3000, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "47.242.224.163:7861", "ip": "47.242.224.163", "port": 7861, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "136.80.123.3:8000", "ip": "136.80.123.3", "port": 8000, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "136.80.71.0:8000", "ip": "136.80.71.0", "port": 8000, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "47.85.41.147:8090", "ip": "47.85.41.147", "port": 8090, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "54.67.128.75:5000", "ip": "54.67.128.75", "port": 5000, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "128.134.161.211:4000", "ip": "128.134.161.211", "port": 4000, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "54.69.242.238:5000", "ip": "54.69.242.238", "port": 5000, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "163.176.96.227:4000", "ip": "163.176.96.227", "port": 4000, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "150.136.212.124:8001", "ip": "150.136.212.124", "port": 8001, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "3.224.16.46:8001", "ip": "3.224.16.46", "port": 8001, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "150.136.100.139:9000", "ip": "150.136.100.139", "port": 9000, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "150.136.65.43:8000", "ip": "150.136.65.43", "port": 8000, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "150.136.55.128:8080", "ip": "150.136.55.128", "port": 8080, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "35.208.126.201:8000", "ip": "35.208.126.201", "port": 8000, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "3.224.20.114:8000", "ip": "3.224.20.114", "port": 8000, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "150.136.129.227:8000", "ip": "150.136.129.227", "port": 8000, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "43.98.190.111:8002", "ip": "43.98.190.111", "port": 8002, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
-{"host": "125.229.109.139:4000", "ip": "125.229.109.139", "port": 4000, "endpoint_path": "/v1/models", "chat_path": "/v1/chat/completions"}
+{"host": "133.220.249.17:8000", "models": [], "sidecar": {}, "src": "validated_25.json"}
+{"host": "71.202.136.184:8888", "models": [], "sidecar": {}, "src": "validated_4.json"}
+{"host": "71.202.60.19:8000", "models": [], "sidecar": {}, "src": "validated_4.json"}
+{"host": "113.80.118.11:18081", "models": [], "sidecar": {}, "src": "validated_46.json"}
+{"host": "43.198.200.34:4000", "models": [], "sidecar": {}, "src": "validated_49.json"}
+{"host": "79.214.127.107:8000", "models": [], "sidecar": {}, "src": "validated_51.json"}
+{"host": "117.67.189.50:8002", "models": [], "sidecar": {}, "src": "validated_51.json"}
