@@ -1,0 +1,73 @@
+name: Swarm Matrix Validator
+
+on:
+  workflow_dispatch:
+    inputs:
+      chunk_start:
+        description: 'Starting chunk index (e.g. 0 for chunks 0-19)'
+        required: true
+        default: '0'
+      models:
+        description: 'Max models per host (0 = ALL advertised chat models)'
+        required: true
+        default: '0'
+      host_budget:
+        description: 'Soft per-host wall clock seconds (raise for a dense-router drain)'
+        required: false
+        default: '90'
+      workers:
+        description: 'Workers per runner'
+        required: true
+        default: '32'
+      timeout:
+        description: 'Timeout seconds'
+        required: true
+        default: '10'
+
+jobs:
+  swarm:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install aiohttp
+
+      - name: Run Shard Validation
+        env:
+          HOST_BUDGET: ${{ github.event.inputs.host_budget || 90 }}
+        run: |
+          CHUNK_IDX=$(( ${{ github.event.inputs.chunk_start }} + ${{ matrix.slot }} ))
+          TARGET_FILE="data/chunks/chunk_${CHUNK_IDX}.txt"
+          OUT_FILE="results_chunk_${CHUNK_IDX}.json"
+          if [ -f "$TARGET_FILE" ]; then
+            echo "🚀 Processing Chunk $CHUNK_IDX ($(wc -l < $TARGET_FILE) hosts)..."
+            python3 validate_v2.py \
+              --hosts "$TARGET_FILE" \
+              --models "${{ github.event.inputs.models }}" \
+              --workers "${{ github.event.inputs.workers }}" \
+              --timeout "${{ github.event.inputs.timeout }}" \
+              -o "$OUT_FILE"
+          else
+            echo "⚠️ File $TARGET_FILE not found."
+            echo "[]" > "$OUT_FILE"
+          fi
+
+      - name: Upload Shard Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-chunk-${{ matrix.slot }}
+          path: |
+            results_chunk_*.json
+            results_chunk_*.jsonl
