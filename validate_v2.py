@@ -38,8 +38,14 @@ TOPIC_PROMPT = "Write a 3-line haiku about a teal bicycle. It must mention a bic
 TOPIC_KEYWORDS = ["bicycle", "bike", "pedal", "wheel", "teal", "ride", "cycle", "spoke", "chain"]
 TTFT_CEILING = 4.0  # seconds — max time to first real content chunk
 STREAM_EARLY_CHUNKS = 5  # exit streaming once this many content chunks received
-HOST_BUDGET = 90.0  # seconds — max total time per host
+HOST_BUDGET = float(os.environ.get("HOST_BUDGET", "90"))  # soft per-host wall clock; raise for a targeted drain pass
 CONNECT_TIMEOUT = 2.0  # seconds — TCP connect timeout per request
+# 2026-10-26 (Y6): in-host model concurrency starts conservative and widens only on
+# evidence (fast, unthrottled host), so a dense router finishes its advertised list
+# inside one pass instead of bleeding into HOST_BUDGET_EXHAUSTED.
+MODEL_SEM_START = int(os.environ.get("MODEL_SEM_START", "2"))
+MODEL_SEM_MAX = int(os.environ.get("MODEL_SEM_MAX", "6"))
+MODEL_SEM_FAST_S = float(os.environ.get("MODEL_SEM_FAST_S", "0.35"))
 
 CANDIDATE_PATHS = [
     ("/v1/models",        "/v1/chat/completions"),
@@ -294,6 +300,72 @@ def _is_frontier_spoof(req_model: str, resp_model: str | None) -> bool:
     return False
 
 
+class AdaptiveSem:
+    """In-host model concurrency that widens on evidence, never on hope.
+
+    Widening = release() without a matching acquire() (the documented way to raise a
+    Semaphore's internal value), so a host answering in <MODEL_SEM_FAST_S with no 429s
+    runs up to MODEL_SEM_MAX models in flight, while a slow or throttled router stays
+    at the conservative width that avoids self-inflicted upstream RPM 429s. A 429 never
+    shrinks an already-widened window (a Semaphore cannot safely reclaim a permit in
+    flight); it resets the fast streak and raises the bar for the next widening.
+    """
+
+    def __init__(self, start=2, cap=6, fast_s=0.35, min_samples=3):
+        self._sem = asyncio.Semaphore(start)
+        self.cap = max(start, cap)
+        self.fast_s = fast_s
+        self.min_samples = min_samples
+        self.cur = start
+        self._fast = 0
+        self._throttled = 0
+
+    async def __aenter__(self):
+        await self._sem.acquire()
+        return self
+
+    async def __aexit__(self, *exc):
+        self._sem.release()
+
+    def observe(self, elapsed_s, hit_429=False):
+        """Feed one completed model call back into the width decision."""
+        if hit_429:
+            self._throttled += 1
+            self._fast = 0
+            return
+        if elapsed_s <= self.fast_s:
+            self._fast += 1
+            if self._fast >= self.min_samples and self._fast > 3 * self._throttled and self.cur < self.cap:
+                self._sem.release()  # add one in-flight slot
+                self.cur += 1
+                self._fast = 0
+
+
+def resume_plan(chat_models, prior_alive, max_models):
+    """(reused_rows, models_to_test) for a resuming pass.
+
+    Prior-ALIVE models are carried forward instead of re-tested, so a second pass
+    spends its whole budget on the tail a first pass never reached — the fix for
+    "one attempt decides forever" on dense routers. Failed models are deliberately
+    NOT skipped: a transient timeout gets a fresh attempt every pass.
+    """
+    reused = [prior_alive[m] for m in chat_models if m in prior_alive]
+    todo = [m for m in chat_models if m not in prior_alive]
+    if max_models and max_models > 0:
+        todo = todo[:max_models]
+    return reused, todo
+
+
+def _visible_text(res):
+    """content, falling back to a reasoning channel (a thinking model may emit only reasoning)."""
+    if not isinstance(res, dict):
+        return ""
+    return (res.get("content")
+            or (res.get("raw_msg") or {}).get("reasoning_content")
+            or res.get("reasoning_content")
+            or "")
+
+
 async def validate_model(session, base, chat_path, model, timeout, retries_429=1, headers=None, extra_payload=None):
     checks, score = {}, 0
     active_model = model
@@ -456,10 +528,25 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=1
     # HARD: Topic-Fidelity Check (max_tokens=1024 so reasoning preamble never starves the haiku!)
     rt = await chat(session, base, chat_path, model, TOPIC_PROMPT, timeout, max_tokens=1024, headers=headers, extra_payload=extra_payload)
     if rt.get("status") == 200:
-        ct = rt.get("content", "").lower()
+        ct = _visible_text(rt).lower()
+        if not ct.strip():
+            # A1 (2026-10-26): empty prose on a host whose arithmetic passed is a LIVE
+            # model with a starved/blocked visible channel, not a canned stub. One richer
+            # retry (reasoning_effort=none + reasoning-channel fallback) before the verdict
+            # drops from a hard kill to a partial class.
+            retry_extra = dict(extra_payload or {})
+            retry_extra["reasoning_effort"] = "none"
+            rt2 = await chat(session, base, chat_path, model, TOPIC_PROMPT, timeout,
+                             max_tokens=2048, headers=headers, extra_payload=retry_extra)
+            ct = _visible_text(rt2).lower()
+            checks["empty_content_retry"] = bool(ct.strip())
         if any(k in ct for k in TOPIC_KEYWORDS):
             score += 2
             checks["topic_fidelity"] = "pass"
+        elif not ct.strip():
+            checks["topic_fidelity"] = "EMPTY_CONTENT_ALIVE"
+            if str(checks.get("arithmetic")) == "pass":
+                score += 1
         else:
             checks["topic_fidelity"] = f"CANNED_STUB_FAIL:{ct[:60]!r}"
             return {"model": model, "score": 0, "tier": "FAKE_CANNED_STUB", "checks": checks}
@@ -471,6 +558,10 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=1
         return {"model": model, "score": score, "tier": "FAKE_MODEL_SPOOF", "checks": checks}
     if checks.get("variance") == "IDENTICAL_REPLAY_SUSPECT" or str(checks.get("arithmetic", "")).startswith("wrong_answer:"):
         return {"model": model, "score": 0, "tier": "FAKE_CANNED_STUB", "checks": checks}
+    # A1 (2026-10-26): alive-but-empty is a PARTIAL class, reported as itself — never
+    # hard-zeroed as a canned stub (accuracy), and never wired as GOLD/SILVER (yield).
+    if str(checks.get("topic_fidelity", "")).startswith("EMPTY_CONTENT_ALIVE"):
+        return {"model": model, "score": score, "tier": "EMPTY_CONTENT_ALIVE", "checks": checks}
 
     tier = "GOLD" if score >= 9 else "SILVER" if score >= 6 else "BRONZE" if score >= 3 else "FAKE"
     return {"model": model, "score": score, "tier": tier, "checks": checks}
@@ -765,7 +856,7 @@ async def _sidecar_triage(session, ip: str, port: int, base: str) -> dict | None
     return None
 
 
-async def validate_host(session, host, timeout, max_models, sem, ledger_fp=None, ledger_lock=None):
+async def validate_host(session, host, timeout, max_models, sem, ledger_fp=None, ledger_lock=None, prior_alive=None):
     if ":" not in host:
         result = {"host": host, "tier": "DEAD", "error": "invalid_format", "working_models": []}
         _ledger_write(ledger_fp, ledger_lock, result)
@@ -831,17 +922,23 @@ async def validate_host(session, host, timeout, max_models, sem, ledger_fp=None,
             chat_models = raw_models  # fallback if all got filtered
         chat_models = sort_models_by_priority(chat_models)
 
-        # Cap generative models if specified (default 25)
-        models_to_test = chat_models if max_models <= 0 else chat_models[:max_models]
+        # Y6 (2026-10-26): resume — carry previously-ALIVE models forward and spend this
+        # pass's budget on the tail a prior pass never reached. Failed models are NOT
+        # skipped, so a transient timeout is re-attempted on every pass.
+        reused, models_to_test = resume_plan(chat_models, prior_alive or {}, max_models)
 
-        # Step 2: Validate models concurrently (Semaphore(2) to avoid self-inflicted RPM 429s)
-        model_sem = asyncio.Semaphore(2)
+        # Step 2: adaptive in-host concurrency (MODEL_SEM_START → MODEL_SEM_MAX once the
+        # host proves fast and 429-free; a slow/throttled router keeps the safe width).
+        model_sem = AdaptiveSem(MODEL_SEM_START, MODEL_SEM_MAX, MODEL_SEM_FAST_S)
         async def run_m(m):
             async with model_sem:
-                return await validate_model(session, base, discovered_chat, m, timeout, headers=auth_headers)
+                t_m = time.time()
+                r = await validate_model(session, base, discovered_chat, m, timeout, headers=auth_headers)
+                model_sem.observe(time.time() - t_m, hit_429="429_active_relay" in str(r.get("checks") or {}))
+                return r
 
         # Host-level total budget — collect partial results even on timeout
-        results = []
+        results = list(reused)
         try:
             async with asyncio.timeout(HOST_BUDGET):
                 async def collect(m):
@@ -850,13 +947,16 @@ async def validate_host(session, host, timeout, max_models, sem, ledger_fp=None,
                     return r
                 await asyncio.gather(*(collect(m) for m in models_to_test))
         except asyncio.TimeoutError:
-            # Budget exhausted — fill remaining with placeholder
+            # Budget exhausted — the untouched tail stays HOST_BUDGET_EXHAUSTED and is
+            # re-queued by the NEXT pass (resume skips only models that proved ALIVE).
             for m in models_to_test:
                 if not any(r.get("model") == m for r in results):
                     results.append({"model": m, "score": 0, "tier": "HOST_BUDGET_EXHAUSTED", "checks": {}})
 
         working = [r for r in results if r["tier"] in ("GOLD", "SILVER")]
         snapped = [r for r in results if r["tier"].startswith("SNAPPED_")]
+        partial = [r for r in results if r["tier"] == "EMPTY_CONTENT_ALIVE"]
+        exhausted = [r for r in results if r["tier"] == "HOST_BUDGET_EXHAUSTED"]
 
         if any(r["tier"] == "GOLD" for r in results):
             host_tier = "GOLD"
@@ -907,15 +1007,27 @@ async def validate_host(session, host, timeout, max_models, sem, ledger_fp=None,
             "tested_models_count": len(results),
             "working_models_count": len(working),
             "working_models": working,
+            "partial_models": partial,
             "all_results": results,
             "gateway_signals": gateway_signals,
+            # AC-1 evidence: coverage = (models with a verdict this pass) / (advertised chat
+            # models). Resume carries prior-ALIVE rows, so coverage climbs pass over pass
+            # until it reaches 1.0 on a dense router.
+            "advertised_chat": len(chat_models),
+            "tested_model_ids": [r.get("model") for r in results],
+            "reused_from_ledger": len(reused),
+            "budget_exhausted": len(exhausted),
+            "coverage": round(len({r.get("model") for r in results}) / max(len(chat_models), 1), 4),
             "elapsed_s": round(time.time() - host_t0, 2)
         }
 
         # Real-time stdout logging!
         if host_tier in ("GOLD", "SILVER"):
             flag = "👑" if host_tier == "GOLD" else "🥈"
-            print(f"{flag} {host:22} {host_tier:8} working={len(working)}/{len(raw_models)} ({[m['model'] for m in working][:3]})", flush=True)
+            cov = len({r.get("model") for r in results})
+            print(f"{flag} {host:22} {host_tier:8} working={len(working)}/{len(raw_models)} "
+                  f"coverage={cov}/{len(chat_models)} reused={len(reused)} partial={len(partial)} "
+                  f"({[m['model'] for m in working][:3]})", flush=True)
 
         _ledger_write(ledger_fp, ledger_lock, out_obj)
         return out_obj
@@ -989,6 +1101,23 @@ async def main():
 
     # JSONL ledger for incremental results
     ledger_path = args.out.replace(".json", ".jsonl") if args.out.endswith(".json") else args.out + ".jsonl"
+
+    # Y6 resume (2026-10-26): an existing ledger for this --out means a prior pass ran here.
+    # Carry its ALIVE rows forward so this pass's budget goes to the tail that pass never reached.
+    prior = {}
+    if os.path.exists(ledger_path) and os.path.getsize(ledger_path) > 0:
+        with open(ledger_path) as fp_prev:
+            for line in fp_prev:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                alive = {r.get("model"): r for r in (rec.get("all_results") or [])
+                         if r.get("tier") in ("GOLD", "SILVER") and r.get("model")}
+                if alive:
+                    prior[rec.get("host")] = alive
+        print(f"♻️  Resume: {len(prior)} host(s) carry prior-ALIVE models (not re-tested)", flush=True)
+
     ledger_fp = open(ledger_path, "a")
     import threading
     ledger_lock = threading.Lock()
@@ -996,7 +1125,7 @@ async def main():
     sem = asyncio.Semaphore(args.workers)
     conn = aiohttp.TCPConnector(limit=args.workers * 4, ttl_dns_cache=300, ssl=False)
     async with aiohttp.ClientSession(connector=conn) as session:
-        out = await asyncio.gather(*(validate_host(session, h, args.timeout, args.models, sem, ledger_fp, ledger_lock) for h in filtered_hosts))
+        out = await asyncio.gather(*(validate_host(session, h, args.timeout, args.models, sem, ledger_fp, ledger_lock, prior.get(h)) for h in filtered_hosts))
 
     elapsed = time.time() - t0
     ledger_fp.close()
@@ -1007,6 +1136,11 @@ async def main():
     counts = dict(Counter(r["tier"] for r in out))
     print(f"\n✨ Completed in {elapsed:.1f}s ({len(filtered_hosts)/max(elapsed, 0.1):.1f} hosts/s)")
     print(f"📊 Host Tiers Summary: {counts}", flush=True)
+    if prior:
+        print(f"♻️  Resumed hosts: {len(prior)} (prior-ALIVE models carried forward, not re-tested)", flush=True)
+    full = sum(1 for r in out if r.get("coverage", 0) >= 0.999)
+    print(f"🎯 Full-coverage hosts: {full}/{len(out)}; budget-exhausted models: "
+          f"{sum(r.get('budget_exhausted', 0) for r in out)}", flush=True)
     print(f"📋 Incremental ledger: {ledger_path}", flush=True)
 
 if __name__ == "__main__":
