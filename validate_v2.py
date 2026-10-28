@@ -62,6 +62,15 @@ DEFAULT_TEMPLATE_KEYS = (
     "Bearer EMPTY",
 )
 
+UNLISTED_CANARY_MODELS = (
+    "claude-sonnet-4-6",
+    "claude-opus-4-6",
+    "gpt-5",
+    "gpt-4o",
+    "gemini-2.5-pro",
+    "deepseek-r1",
+)
+
 FRONTIER_PRIORITY_PREFIXES = (
     "[按量", "按量ccmax", "小e-", "单间-", "claude-opus", "claude-sonnet-4",
     "anthropic.claude", "us.openai.gpt-6", "gpt-6", "gpt-5", "o3", "o4",
@@ -101,6 +110,19 @@ STUB_MARKERS = [
     "the tide turns slowly", "water folds the morning in",
     "hello! i'm doing well, thank you", "ironclad-7b", "nexus-7b-sec", "gpus4all",
     "no active credentials for provider", "我会一步步为你拆解", "响应。\n\n我会一步步",
+    "upstream node queue is busy", "queue timeout", "waiting for server response",
+    "waiting for response", "llm is responding", "upstream node is busy",
+    "glm-5 node active", "this node is serving", "ready. this node is serving",
+    "send the task and i will", "with max_model_len=", "tensor parallel",
+    "would you like me to go into more detail", "let me know if you'd like me to elaborate",
+    "several important aspects to consider", "i can provide some context on this topic",
+    "key consideration here involves understanding the underlying requirements",
+    "common scenario that many users encounter",
+    "proxy error] all message sending strategies failed",
+    "this involves balancing several tradeoffs",
+    "i've seen similar requests before and can offer some guidance",
+    "synthetic diagnostic", "no model was executed", "default profile credentials",
+    "canarytoken", "webhook.site", "oastify.com", "burpcollaborator", "requestbin",
 ]
 
 THINK_STRIP_RE = re.compile(r"<think(?:ing)?>.*?</think(?:ing)?>\s*", re.DOTALL | re.IGNORECASE)
@@ -125,6 +147,70 @@ def check_stub(text: str) -> bool:
         return True
     low = text.lower()
     return any(m in low for m in STUB_MARKERS)
+
+
+def _strip_prompt_echo(text: str, prompt: str) -> str:
+    """Remove echoed prompt text before checking answers so template echo-bots cannot pass."""
+    if not text:
+        return ""
+    if not prompt:
+        return text
+    cleaned = re.sub(re.escape(prompt), "", text, flags=re.IGNORECASE)
+    for clause in prompt.split("."):
+        c = clause.strip()
+        if len(c) >= 15:
+            cleaned = re.sub(re.escape(c), "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
+def _parse_sse_fallback(raw_txt: str) -> dict | None:
+    """Parse SSE 'data: {...}' chunks when a gateway forces streaming on a stream=False call."""
+    if not raw_txt or "data:" not in raw_txt:
+        return None
+    parts, reasoning_parts, resp_model, msg_id = [], [], None, None
+    for raw_line in raw_txt.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        resp_model = resp_model or obj.get("model")
+        msg_id = msg_id or obj.get("id")
+        choices = obj.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            ch0 = choices[0]
+            delta = ch0.get("delta") if isinstance(ch0.get("delta"), dict) else {}
+            msg = ch0.get("message") if isinstance(ch0.get("message"), dict) else {}
+            c_piece = delta.get("content") or msg.get("content") or ""
+            r_piece = delta.get("reasoning_content") or msg.get("reasoning_content") or ""
+            if c_piece:
+                parts.append(str(c_piece))
+            if r_piece:
+                reasoning_parts.append(str(r_piece))
+    if not parts and not reasoning_parts:
+        return None
+    content = "".join(parts)
+    reasoning = "".join(reasoning_parts)
+    full_text = (strip_thinking(content) or reasoning).strip()
+    return {
+        "status": 200,
+        "content": full_text,
+        "raw_msg": {"content": content, "reasoning_content": reasoning},
+        "raw_content": content,
+        "resp_model": resp_model,
+        "tool_calls": [],
+        "finish_reason": "stop",
+        "prompt_tokens": None,
+        "header_leak": False,
+        "forced_sse": True,
+    }
 
 def is_chat_model(m_name: str) -> bool:
     low = m_name.lower()
@@ -161,6 +247,14 @@ async def chat(session, base, chat_path, model, prompt, timeout, stream=False, m
                     try:
                         body = await r.json(content_type=None)
                     except Exception:
+                        try:
+                            raw_sse = await r.text()
+                            sse_parsed = _parse_sse_fallback(raw_sse)
+                            if sse_parsed is not None:
+                                sse_parsed["elapsed"] = time.time() - t0
+                                return sse_parsed
+                        except Exception:
+                            pass
                         return {"status": "bad_json"}
                     if isinstance(body, dict) and (body.get("id") == "chatcmpl-12c423" or body.get("created") == 1677858242):
                         return {"status": 200, "content": "hello! i'm doing well, thank you", "alibaba_honeypot": True, "elapsed": time.time() - t0}
@@ -289,6 +383,50 @@ async def chat(session, base, chat_path, model, prompt, timeout, stream=False, m
         return {"status": "error", "error": str(e)[:100]}
 
 
+CROSS_VENDOR_SPOOF_RULES = {
+    "claude": (
+        "gpt-", "chatgpt", "o1-", "o3-", "o4-", "qwen", "deepseek", "glm", "gemini",
+        "llama", "mistral", "mixtral", "yi-", "moonshot", "kimi", "doubao", "hunyuan",
+        "ernie", "baichuan", "minimax", "phi-", "gemma",
+    ),
+    "gpt-5": (
+        "gpt-3.5", "gpt-4o-mini", "gpt-4-turbo", "claude", "qwen", "deepseek", "glm",
+        "gemini", "llama", "mistral", "kimi", "doubao", "yi-", "phi-", "gemma",
+    ),
+    "gpt-6": (
+        "gpt-3.5", "gpt-4o-mini", "gpt-4-turbo", "claude", "qwen", "deepseek", "glm",
+        "gemini", "llama", "mistral", "kimi", "doubao", "yi-", "phi-", "gemma",
+    ),
+    "gemini-2.5": (
+        "gemini-1.0", "gemini-1.5-flash", "claude", "gpt-", "qwen", "deepseek", "glm",
+        "llama", "mistral", "kimi", "doubao", "phi-",
+    ),
+    "gemini-3": (
+        "gemini-1.0", "gemini-1.5-flash", "claude", "gpt-", "qwen", "deepseek", "glm",
+        "llama", "mistral", "kimi", "doubao", "phi-",
+    ),
+}
+
+PRETENDER_PROSE_SIGNATURES = {
+    "claude": (
+        "i am qwen", "i'm qwen", "created by alibaba", "developed by alibaba",
+        "i am deepseek", "i'm deepseek", "developed by deepseek",
+        "i am chatgpt", "i'm chatgpt", "trained by openai", "created by openai",
+        "i am glm", "zhipu ai", "i am llama", "nexus-7b", "ironclad-7b",
+    ),
+    "gpt-": (
+        "i am qwen", "i'm qwen", "created by alibaba", "developed by alibaba",
+        "i am deepseek", "i'm deepseek", "developed by deepseek",
+        "i am claude", "created by anthropic", "i am glm", "zhipu ai", "nexus-7b", "ironclad-7b",
+    ),
+    "gemini": (
+        "i am qwen", "created by alibaba", "i am deepseek", "developed by deepseek",
+        "i am chatgpt", "trained by openai", "i am claude", "created by anthropic",
+        "i am glm", "nexus-7b", "ironclad-7b",
+    ),
+}
+
+
 def _is_frontier_spoof(req_model: str, resp_model: str | None) -> bool:
     if not resp_model:
         return False
@@ -297,6 +435,26 @@ def _is_frontier_spoof(req_model: str, resp_model: str | None) -> bool:
     if any(f in req_low for f in ("claude", "gpt-5", "gpt-6", "o3", "o4", "gemini-2.5", "gemini-3")):
         if any(s in resp_low for s in SMALL_LOCAL_SPOOF_FAMILIES):
             return True
+    for family, forbidden in CROSS_VENDOR_SPOOF_RULES.items():
+        if family in req_low and family not in resp_low:
+            if any(bad in resp_low for bad in forbidden):
+                return True
+    return False
+
+
+def _is_pretender_content(req_model: str, content: str | None) -> bool:
+    """Detect prose self-identification that contradicts the requested model family."""
+    if not req_model or not content:
+        return False
+    req_low = req_model.lower()
+    c_low = content.lower()
+    if any(k in c_low for k in ("upstream provider", "returned http", "status code", "502 bad gateway", "rate limit")):
+        return False
+    for family, signs in PRETENDER_PROSE_SIGNATURES.items():
+        if family in req_low:
+            for s in signs:
+                if s in c_low:
+                    return True
     return False
 
 
@@ -410,10 +568,10 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=1
 
     if st1 == 200:
         res1 = res1 if isinstance(res1, dict) else {}
-        c1 = res1.get("content", "")
+        c1 = _strip_prompt_echo(res1.get("content", ""), p1_prompt)
         raw_c1 = res1.get("raw_content", "") or c1
-        if _is_frontier_spoof(model, res1.get("resp_model")):
-            checks["model_echo_mismatch"] = f"{model}->{res1.get('resp_model')}"
+        if _is_frontier_spoof(model, res1.get("resp_model")) or _is_pretender_content(model, c1):
+            checks["model_echo_mismatch"] = f"{model}->{res1.get('resp_model') or 'prose_pretender'}"
         if c1.strip() and not check_stub(c1):
             score += 1
             checks[p1_name] = "pass"
@@ -463,7 +621,10 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=1
         res = await chat(session, base, chat_path, model, prompt, timeout, headers=headers, extra_payload=extra_payload)
         st = res.get("status") if isinstance(res, dict) else "error"
         if st == 200:
-            content = res.get("content", "") if isinstance(res, dict) else ""
+            raw_content = res.get("content", "") if isinstance(res, dict) else ""
+            content = _strip_prompt_echo(raw_content, prompt)
+            if _is_frontier_spoof(model, res.get("resp_model")) or _is_pretender_content(model, content):
+                checks["model_echo_mismatch"] = f"{model}->{res.get('resp_model') or 'prose_pretender'}"
             if content.strip() and not check_stub(content):
                 score += 1
                 checks[name] = "pass"
@@ -489,6 +650,8 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=1
     r2 = await chat(session, base, chat_path, model, VARIANCE_PROMPT, timeout, max_tokens=1024, headers=headers, extra_payload=extra_payload)
     if r1.get("status") == 200 and r2.get("status") == 200:
         c1, c2 = r1.get("content", "").strip(), r2.get("content", "").strip()
+        if c1:
+            checks["creative_sample"] = c1[:200]
         if c1 and c2 and c1 != c2:
             score += 2
             checks["variance"] = "pass"
@@ -496,10 +659,14 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=1
             checks["variance"] = "IDENTICAL_REPLAY_SUSPECT"
 
     # Verifiable Arithmetic Check — word-boundary regex on 391 (max_tokens=1024 for thinking models)
+    # Strip any echoed prompt first and reject kitchen-sink stubs that stuff unrelated canary words.
     ra = await chat(session, base, chat_path, model, ARITH_PROMPT, timeout, max_tokens=1024, headers=headers, extra_payload=extra_payload)
     if ra.get("status") == 200:
-        content = ra.get("content", "")
-        if ARITH_RE.search(content):
+        raw_arith = ra.get("content", "")
+        content = _strip_prompt_echo(raw_arith, ARITH_PROMPT)
+        echoed_prompt = ARITH_PROMPT[:20].lower() in raw_arith.lower()
+        stuffed_canary = any(w in content.lower() for w in ("bicycle", "fizzbuzz", "is_palindrome"))
+        if ARITH_RE.search(content) and not echoed_prompt and not stuffed_canary:
             score += 2
             checks["arithmetic"] = "pass"
         else:
@@ -536,6 +703,7 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=1
             # drops from a hard kill to a partial class.
             retry_extra = dict(extra_payload or {})
             retry_extra["reasoning_effort"] = "none"
+            retry_extra["enable_thinking"] = False
             rt2 = await chat(session, base, chat_path, model, TOPIC_PROMPT, timeout,
                              max_tokens=2048, headers=headers, extra_payload=retry_extra)
             ct = _visible_text(rt2).lower()
@@ -595,6 +763,8 @@ async def probe_path_fast(session, base, m_path, c_path, headers=None):
                             m_list.extend([str(k) for k in data.keys() if k != "data"])
                     if m_list:
                         return (m_path, c_path, list(dict.fromkeys(m_list)))
+                    if isinstance(data, dict) and ("data" in data or "models" in data):
+                        return (m_path, c_path, list(UNLISTED_CANARY_MODELS))
                 elif r.status in (401, 403) and headers is None and m_path == "/v1/models":
                     for tk in DEFAULT_TEMPLATE_KEYS:
                         hdr = {"Authorization": tk}
@@ -610,6 +780,8 @@ PROXY_CANDIDATE_PORTS = {
     1080, 1081, 2080, 3128, 7890, 7891, 8080, 8081, 8082, 8118, 8888, 9050, 9080, 10808, 10809,
 }
 PURE_PROXY_PORTS = {1080, 1081, 2080, 3128, 7890, 7891, 8118, 9050, 10808, 10809}
+# Container/cluster control-plane ports: skip the LLM battery, go straight to sidecar triage
+CONTROL_PLANE_PORTS = {2375, 2377, 2379, 4243, 10250, 10255, 6443, 4646, 5050, 8500}
 
 
 async def _probe_socks5_exit(ip: str, port: int, timeout: float = 3.0) -> str | None:
@@ -795,7 +967,7 @@ async def _sidecar_triage(session, ip: str, port: int, base: str) -> dict | None
     2. Open-signup OneAPI/NewAPI (/api/status) & Open-WebUI (/api/config)
     3. SOCKS5 + HTTP CONNECT egress proxy check (classifying Residential vs Datacenter exit IP)
     """
-    if port == 2375:
+    if port == 2375 or port == 4243:
         try:
             async with asyncio.timeout(4.0):
                 async with session.get(f"{base}/_ping", timeout=aiohttp.ClientTimeout(total=2.5)) as rp:
@@ -817,6 +989,166 @@ async def _sidecar_triage(session, ip: str, port: int, base: str) -> dict | None
                 return {"sidecar": "DOCKER_DAEMON_AUTHENTIC", "version": v1.get("Version")}
         except Exception:
             return None
+
+    # etcd client API (k8s/stateful backing store) — keys read = cluster secrets
+    if port == 2379:
+        for b_url in (base, f"https://{ip}:{port}"):
+            try:
+                async with asyncio.timeout(4.0):
+                    for ep in ("/v3/kv/range", "/v3alpha/kv/range"):
+                        async with session.post(
+                            f"{b_url}{ep}",
+                            json={"key": "AA==", "range_end": "AA==", "count_only": True},
+                            timeout=aiohttp.ClientTimeout(total=2.5),
+                        ) as rr:
+                            if rr.status == 200:
+                                d = await rr.json(content_type=None)
+                                if isinstance(d, dict) and ("count" in d or "header" in d):
+                                    cnt = int(d.get("count", 0) or 0)
+                                    ver = ""
+                                    try:
+                                        async with session.get(f"{b_url}/version", timeout=aiohttp.ClientTimeout(total=2.0)) as rv:
+                                            ver = (await rv.text())[:60]
+                                    except Exception:
+                                        pass
+                                    return {"sidecar": "OPEN_ETCD", "keys": cnt, "version": ver}
+                    # etcd v2 fallback
+                    async with session.get(f"{b_url}/v2/keys/?recursive=false", timeout=aiohttp.ClientTimeout(total=2.5)) as rv2:
+                        if rv2.status == 200:
+                            d2 = await rv2.json(content_type=None)
+                            if isinstance(d2, dict) and isinstance(d2.get("node"), dict):
+                                nodes = d2["node"].get("nodes") or []
+                                return {"sidecar": "OPEN_ETCD", "keys": len(nodes), "version": "v2"}
+            except Exception:
+                continue
+        return None
+
+    # kubelet API — /pods env dump (10255 read-only HTTP, 10250 full HTTPS with /exec)
+    if port in (10250, 10255):
+        bases = (f"https://{ip}:{port}", f"http://{ip}:{port}") if port == 10250 else (f"http://{ip}:{port}", f"https://{ip}:{port}")
+        for b_url in bases:
+            try:
+                async with asyncio.timeout(4.0):
+                    async with session.get(f"{b_url}/pods", timeout=aiohttp.ClientTimeout(total=2.5)) as rp:
+                        if rp.status == 200:
+                            d = await rp.json(content_type=None)
+                            if isinstance(d, dict) and isinstance(d.get("items"), list):
+                                kind = "KUBELET_READONLY" if port == 10255 else "KUBELET_API"
+                                return {"sidecar": kind, "pods": len(d["items"]), "scheme": b_url.split("://", 1)[0]}
+            except Exception:
+                continue
+        return None
+
+    # Kubernetes API server — require anonymous RBAC read access on /api/v1/namespaces or /api/v1/pods
+    if port == 6443:
+        for b_url in (f"https://{ip}:{port}", f"http://{ip}:{port}"):
+            try:
+                async with asyncio.timeout(4.0):
+                    ver_str = None
+                    async with session.get(f"{b_url}/version", timeout=aiohttp.ClientTimeout(total=2.5)) as rv:
+                        if rv.status == 200:
+                            d = await rv.json(content_type=None)
+                            if isinstance(d, dict) and "gitVersion" in d:
+                                ver_str = d["gitVersion"]
+                    for check_ep in ("/api/v1/namespaces", "/api/v1/pods?limit=1"):
+                        async with session.get(f"{b_url}{check_ep}", timeout=aiohttp.ClientTimeout(total=2.5)) as ra:
+                            if ra.status == 200:
+                                da = await ra.json(content_type=None)
+                                if isinstance(da, dict) and isinstance(da.get("items"), list):
+                                    return {
+                                        "sidecar": "K8S_API_SERVER",
+                                        "version": ver_str or "unknown",
+                                        "anon_api": True,
+                                        "endpoint": check_ep,
+                                        "items": len(da["items"]),
+                                    }
+            except Exception:
+                continue
+        return None
+
+    # Docker Swarm manager API — require unauthenticated /nodes list access
+    if port == 2377:
+        for b_url in (base, f"https://{ip}:{port}"):
+            try:
+                async with asyncio.timeout(4.0):
+                    async with session.get(f"{b_url}/version", timeout=aiohttp.ClientTimeout(total=2.5)) as rv:
+                        if rv.status == 200:
+                            d = await rv.json(content_type=None)
+                            if isinstance(d, dict) and {"Version", "ApiVersion"}.issubset(d.keys()):
+                                async with session.get(f"{b_url}/nodes", timeout=aiohttp.ClientTimeout(total=2.5)) as rn:
+                                    if rn.status == 200:
+                                        nodes = await rn.json(content_type=None)
+                                        if isinstance(nodes, list):
+                                            return {"sidecar": "SWARM_MANAGER", "version": d.get("Version"),
+                                                    "nodes": len(nodes), "nodes_list": True}
+            except Exception:
+                continue
+        return None
+
+    # HashiCorp Nomad HTTP API — require unauth /v1/jobs list (ACL-locked returns 403)
+    if port == 4646:
+        for b_url in (base, f"https://{ip}:{port}"):
+            try:
+                async with asyncio.timeout(4.0):
+                    async with session.get(f"{b_url}/v1/agent/health", timeout=aiohttp.ClientTimeout(total=2.5)) as rh:
+                        if rh.status == 200:
+                            async with session.get(f"{b_url}/v1/jobs", timeout=aiohttp.ClientTimeout(total=2.5)) as rj:
+                                if rj.status == 200:
+                                    jobs = await rj.json(content_type=None)
+                                    if isinstance(jobs, list):
+                                        return {"sidecar": "OPEN_NOMAD", "jobs": len(jobs)}
+            except Exception:
+                continue
+        return None
+
+    # Apache Mesos master — unauth framework submit = RCE
+    if port == 5050:
+        try:
+            async with asyncio.timeout(4.0):
+                async with session.get(f"{base}/master/state.json", timeout=aiohttp.ClientTimeout(total=2.5)) as rs:
+                    if rs.status == 200:
+                        d = await rs.json(content_type=None)
+                        if isinstance(d, dict) and ("cluster" in d or "slaves" in d or "frameworks" in d):
+                            return {"sidecar": "OPEN_MESOS", "cluster": d.get("cluster"),
+                                    "agents": len(d.get("slaves") or [])}
+        except Exception:
+            return None
+
+    # HashiCorp Consul — require unauth KV keys list (ACL-locked returns 403)
+    if port == 8500:
+        for b_url in (base, f"https://{ip}:{port}"):
+            try:
+                async with asyncio.timeout(4.0):
+                    async with session.get(f"{b_url}/v1/agent/self", timeout=aiohttp.ClientTimeout(total=2.5)) as ra:
+                        if ra.status == 200:
+                            d = await ra.json(content_type=None)
+                            if isinstance(d, dict) and "Config" in d:
+                                cfg = (d or {}).get("Config", {})
+                                async with session.get(f"{b_url}/v1/kv/?keys", timeout=aiohttp.ClientTimeout(total=2.5)) as rk:
+                                    if rk.status == 200:
+                                        keys = await rk.json(content_type=None)
+                                        if isinstance(keys, list):
+                                            return {"sidecar": "OPEN_CONSUL", "datacenter": cfg.get("Datacenter"),
+                                                    "kv_keys": len(keys)}
+            except Exception:
+                continue
+        return None
+
+    # Private Docker Registry v2 (commonly on :5000) — check when LLM discovery didn't match
+    if port == 5000:
+        try:
+            async with asyncio.timeout(3.0):
+                async with session.get(f"{base}/v2/_catalog", timeout=aiohttp.ClientTimeout(total=2.5)) as rr:
+                    if rr.status == 200:
+                        d = await rr.json(content_type=None)
+                        if isinstance(d, dict) and isinstance(d.get("repositories"), list) and len(d["repositories"]) > 0:
+                            return {
+                                "sidecar": "OPEN_DOCKER_REGISTRY",
+                                "repos": len(d["repositories"]),
+                                "sample": d["repositories"][:5],
+                            }
+        except Exception:
+            pass
 
     if port not in PURE_PROXY_PORTS:
         for p_path, p_kind in (("/api/status", "newapi"), ("/api/config", "open_webui")):
@@ -876,15 +1208,16 @@ async def validate_host(session, host, timeout, max_models, sem, ledger_fp=None,
         _ledger_write(ledger_fp, ledger_lock, result)
         return result
 
-    scheme = "https" if port in (443, 8443, 2053, 2083, 2087, 2096) else "http"
+    scheme = "https" if port in (443, 8443, 6443, 10250, 2376, 2053, 2083, 2087, 2096) else "http"
     base = f"{scheme}://{ip}:{port}"
     host_t0 = time.time()
     async with sem:
         # Fast-path pure proxy/tunnel ports (1080, 7890, 10808, 3128, etc.) straight to proxy triage
-        if port in PURE_PROXY_PORTS:
+        if port in PURE_PROXY_PORTS or port in CONTROL_PLANE_PORTS:
             sidecar = await _sidecar_triage(session, ip, port, base)
             result = {"host": host, "tier": sidecar["sidecar"] if sidecar else "DEAD",
-                      "error": "pure_proxy_port", "sidecar": sidecar, "working_models": []}
+                      "error": "pure_proxy_port" if port in PURE_PROXY_PORTS else "control_plane_port",
+                      "sidecar": sidecar, "working_models": []}
             _ledger_write(ledger_fp, ledger_lock, result)
             return result
 
@@ -954,6 +1287,19 @@ async def validate_host(session, host, timeout, max_models, sem, ledger_fp=None,
                     results.append({"model": m, "score": 0, "tier": "HOST_BUDGET_EXHAUSTED", "checks": {}})
 
         working = [r for r in results if r["tier"] in ("GOLD", "SILVER")]
+        # Cross-model byte-identical replay guard (model-authenticity-triage Rule #5):
+        # If >=3 models on the same host return the exact same non-empty creative prose sample
+        # (never code like fizzbuzz, which can canonically match), the host is a canned stub.
+        if len(working) >= 3:
+            samples = [str((r.get("checks") or {}).get("creative_sample") or "").strip() for r in working]
+            non_empty_samples = [s for s in samples if len(s) >= 12]
+            if len(non_empty_samples) >= 3 and len(set(non_empty_samples)) == 1:
+                for r in working:
+                    r["tier"] = "FAKE_CANNED_STUB"
+                    r["score"] = 0
+                    if isinstance(r.get("checks"), dict):
+                        r["checks"]["cross_model_identical_replay"] = True
+                working = []
         snapped = [r for r in results if r["tier"].startswith("SNAPPED_")]
         partial = [r for r in results if r["tier"] == "EMPTY_CONTENT_ALIVE"]
         exhausted = [r for r in results if r["tier"] == "HOST_BUDGET_EXHAUSTED"]
