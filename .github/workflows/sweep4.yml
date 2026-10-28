@@ -6,7 +6,7 @@ on:
       ports:
         description: 'ports'
         required: true
-        default: '8000,8080,3000,3001,3002,3003,3004,3005,4000,30000,8081,8082,8088,8089,8090,5000,5001,8001,8002,6333,2375,1234,11434,7860,7861,8888,2718,5002,9000,9200,5678,8501,7890,7891,10808,10809,1080,2080,3128,8118'
+        default: '8000,8080,3000,3001,3002,3004,3005,4000,30000,8081,8082,8085,8086,8088,8089,8090,8100,8443,5000,5001,5002,8001,8002,8005,9000,9001,8888,5678,1234,7860,7861,18081,23333,11435,9999,12345,1080,2080,3128,7890,7891,8118,10808,10809,2375,2379,2377,4243,10250,10255,6443,4646,5050,8500'
       rate:
         description: 'packets per second'
         required: true
@@ -33,9 +33,11 @@ jobs:
         uses: actions/checkout@v4
       - name: Install scan and validation tools
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq masscan
-          pip install -q aiohttp
+          sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* || true
+          for i in 1 2 3; do sudo apt-get update -qq && break || sleep 5; done
+          for i in 1 2 3; do sudo apt-get install -y -qq masscan && break || sleep 5; done
+          python3 -m pip install -q aiohttp
+          masscan --version | head -2 || true
       - name: Run shard ${{ matrix.slot }} (Scan -> Filter Middleboxes -> Validate)
         env:
           HOST_BUDGET: ${{ github.event.inputs.host_budget || 90 }}
