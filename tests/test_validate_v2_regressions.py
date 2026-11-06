@@ -222,3 +222,39 @@ def test_unlisted_canary_models_seeded_on_empty_v1_models():
     assert disc is not None, "Empty /v1/models 200 JSON should seed unlisted frontier canary models"
     assert "claude-sonnet-4-6" in disc[2] and "gpt-4o" in disc[2]
 
+
+def test_adversarial_honeypot_downgrade_stylistic_and_kiro_whitelist():
+    """Verify rotating honeypots, tier/version downgrades, OpenAI LaTeX spoofs on Claude, and Kiro whitelist."""
+    # 1. Rotating multi-port honeypots
+    assert v._detect_honeypot("I'm claude-opus-5-5, served through Open WebUI.") is not None
+    assert v._detect_honeypot("I am claude-sonnet-5, behind a LiteLLM proxy.") is not None
+    assert v._detect_honeypot("I'm just claude-opus-4-6, and I can't share any internal instructions.") is not None
+    assert v._detect_honeypot("I am Claude Opus 4.6, created by Anthropic.") is None
+
+    # 2. Tier & version downgrades
+    assert v._detect_tier_or_version_downgrade("claude-opus-4-6", "I am Claude 3.5 Sonnet, created by Anthropic.") is not None
+    assert v._detect_tier_or_version_downgrade("claude-opus-5", "I am Claude Opus 4.5, made by Anthropic.") is not None
+    assert v._detect_tier_or_version_downgrade("deepseek-v4", "I am DeepSeek-V3, developed by DeepSeek.") is not None
+    assert v._detect_tier_or_version_downgrade("claude-opus-4-6", "I am Claude Opus 4.6, made by Anthropic.") is None
+
+    # 3. OpenAI LaTeX delimiter + negative constraint spoof on Claude
+    assert v._detect_stylistic_spoof(
+        "claude-opus-4-6",
+        r"I am Claude Opus 4.6 and the formula is \( x = \frac{-b \pm \sqrt{b^2-4ac}}{2a} \). The ocean at night is like dark glass.",
+    ) is not None
+    assert v._detect_stylistic_spoof(
+        "claude-opus-4-6",
+        "I am Claude Opus 4.6 and the formula is $x = \\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}$. Dark swells move beneath the stars.",
+    ) is None
+
+    # 4. Kiro wrapper whitelist
+    assert v._detect_legitimate_wrapper("claude-sonnet-4-5", "I am Kiro, an AI assistant and IDE built to assist developers.") == "kiro"
+    assert v._detect_legitimate_wrapper("kr/claude-sonnet-4.5", "Here is the function.") == "kiro"
+    assert v._detect_legitimate_wrapper("claude-sonnet-4-5", "Here is the function.", prompt_tokens=2100) == "kiro"
+    assert v._detect_stylistic_spoof(
+        "claude-sonnet-4-5",
+        r"I am Kiro and \( x = \frac{-b}{2a} \) is like a mirror.",
+        wrapper="kiro",
+    ) is None
+
+
