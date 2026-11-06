@@ -28,7 +28,7 @@ SOFT_PROMPTS = [
     ("fizzbuzz", "Write a short Python function fizzbuzz(n) that returns 'Fizz', 'Buzz', 'FizzBuzz', or str(n). Output code only."),
     ("logic_riddle", "If I have 10 sheep and all but 7 run away, how many sheep do I have left? Respond with just the single number."),
     ("code_palindrome", "Write a Python function is_palindrome(s) returning boolean. Output code only."),
-    ("creative_short", "Write a 1-sentence thought about the ocean at night."),
+    ("creative_short", "In 2 short sentences: (1) State your exact model name, version/tier, and creator, and write the inline quadratic formula in LaTeX; (2) Share a 1-sentence thought about the ocean at night without using the words 'like' or 'similar'."),
 ]
 VARIANCE_PROMPT = "Write a 1-sentence thought about the ocean at night."
 ARITH_PROMPT = "What is 17*23? Respond with just the number."
@@ -409,22 +409,144 @@ CROSS_VENDOR_SPOOF_RULES = {
 
 PRETENDER_PROSE_SIGNATURES = {
     "claude": (
-        "i am qwen", "i'm qwen", "created by alibaba", "developed by alibaba",
+        "i am qwen", "i'm qwen", "created by alibaba", "developed by alibaba", "tongyi lab",
         "i am deepseek", "i'm deepseek", "developed by deepseek",
-        "i am chatgpt", "i'm chatgpt", "trained by openai", "created by openai",
+        "i am chatgpt", "i'm chatgpt", "i'm a chatgpt", "trained by openai", "created by openai", "developed by openai",
+        "i am gemini", "i'm gemini", "trained by google", "large language model created by google",
+        "helpful ai assistant developed by google",
         "i am glm", "zhipu ai", "i am llama", "nexus-7b", "ironclad-7b",
     ),
     "gpt-": (
-        "i am qwen", "i'm qwen", "created by alibaba", "developed by alibaba",
+        "i am qwen", "i'm qwen", "created by alibaba", "developed by alibaba", "tongyi lab",
         "i am deepseek", "i'm deepseek", "developed by deepseek",
-        "i am claude", "created by anthropic", "i am glm", "zhipu ai", "nexus-7b", "ironclad-7b",
+        "i am claude", "i'm claude", "created by anthropic", "made by anthropic", "developed by anthropic",
+        "i am glm", "zhipu ai", "nexus-7b", "ironclad-7b",
     ),
     "gemini": (
         "i am qwen", "created by alibaba", "i am deepseek", "developed by deepseek",
         "i am chatgpt", "trained by openai", "i am claude", "created by anthropic",
         "i am glm", "nexus-7b", "ironclad-7b",
     ),
+    "deepseek": (
+        "i am claude", "i'm claude", "made by anthropic", "created by anthropic", "developed by anthropic",
+        "i am chatgpt", "i'm chatgpt", "i'm a chatgpt", "created by openai", "developed by openai", "trained by openai",
+        "i am gemini", "i'm gemini", "trained by google", "nexus-7b", "ironclad-7b",
+    ),
+    "kimi": (
+        "i am chatgpt", "i'm chatgpt", "developed by openai", "created by openai", "i am gpt-",
+        "i am claude", "i'm claude", "made by anthropic", "created by anthropic",
+    ),
 }
+
+HONEYPOT_PERSONA_PATTERNS = (
+    "served through open webui",
+    "behind a litellm proxy",
+    "running on koboldcpp",
+    "running in text-generation-webui",
+    "running in anythingllm",
+    "served from lm studio",
+    "served with vllm",
+    "hosted with localai",
+    "i'm ironclad-",
+    "i am ironclad-",
+    "created in-house by the team that runs this server",
+    "how may i help you, kishan",
+    "help you with hotel operations data",
+    "i am active and standing by. please provide your next instruction",
+    "developed by @megohalo",
+)
+
+HONEYPOT_REGEXES = (
+    re.compile(r"\bi(?:'m|\s+am)\s+just\s+[a-z0-9._:-]+,?\s+and\s+i\s+(?:can't|cannot|don't)\s+(?:share|disclose)\s+any\s+(?:internal\s+instructions|system\s+prompts)", re.I),
+    re.compile(r"\bthis\s+is\s+[a-z0-9._:-]+\s+on\s+vllm\b", re.I),
+    re.compile(r"\bi(?:'m|\s+am)\s+[a-z0-9._:-]+,\s+(?:served\s+through|behind\s+a|running\s+on|running\s+in|hosted\s+with|served\s+with|served\s+from)\s+", re.I),
+)
+
+
+def _detect_honeypot(content: str | None) -> str | None:
+    """Detect rotating multi-port honeypots and bespoke gaslighting system prompts."""
+    if not content:
+        return None
+    cl = content.lower()
+    for pat in HONEYPOT_PERSONA_PATTERNS:
+        if pat in cl:
+            return f"pattern:{pat}"
+    for rx in HONEYPOT_REGEXES:
+        m = rx.search(content)
+        if m:
+            return f"regex:{m.group(0)[:60]}"
+    return None
+
+
+def _detect_legitimate_wrapper(req_model: str, content: str | None, prompt_tokens: int | None = None) -> str | None:
+    """Detect explicitly permitted agentic/CLI wrappers (Kiro is whitelisted per operator policy)."""
+    cl = (content or "").lower()
+    rm = (req_model or "").lower()
+    if (
+        "you are kiro" in cl
+        or "i'm kiro" in cl
+        or "i am kiro" in cl
+        or "kiro-cli" in cl
+        or rm.startswith(("kr/", "kiro/"))
+        or (isinstance(prompt_tokens, int) and prompt_tokens >= 1800)
+    ):
+        return "kiro"
+    if "you are claude code" in cl or "claude code, anthropic's official cli" in cl or rm.startswith("cc/"):
+        return "claude_code"
+    if "built on anthropic's claude agent sdk" in cl or "claude agent sdk" in cl:
+        return "claude_agent_sdk"
+    if "provided by duckduckgo" in cl or "assistant in duck.ai" in cl or rm.startswith("ddgw/"):
+        return "duck_ai"
+    return None
+
+
+def _detect_tier_or_version_downgrade(req_model: str, content: str | None, resp_model: str | None = None) -> str | None:
+    """Catch intra-family tier downgrades (Opus -> Sonnet/Haiku) and version downgrades (Opus 5 -> 4.5, Sonnet 4.5 -> 3.5)."""
+    m = (req_model or "").lower().strip()
+    if "/" in m:
+        m = m.rsplit("/", 1)[-1]
+    if ":" in m:
+        m = m.split(":", 1)[0]
+    cl = f"{content or ''}\n{resp_model or ''}".lower()
+    rm = (resp_model or "").lower()
+
+    if "claude" in m or any(m.startswith(p) for p in ("opus-", "sonnet-", "haiku-")):
+        tier = "opus" if ("opus" in m or "fable" in m) else "sonnet" if "sonnet" in m else "haiku" if "haiku" in m else None
+        vm = re.search(r"(?:opus|sonnet|haiku|claude|fable)[-_.]?(\d+)(?:[-_.](\d+))?(?!\d)", m)
+        ver = (int(vm.group(1)), int(vm.group(2)) if vm and vm.group(2) and len(vm.group(2)) <= 2 else 0) if vm else None
+        if tier == "opus":
+            if "sonnet" in rm or re.search(r"\bi(?:'m|\s+am)\s+claude\s+(?:3(?:\.5|\.7)?\s+|4(?:\.5|\.6)?\s+)?sonnet\b", cl) or "specifically claude-sonnet" in cl or "i'm claude-sonnet" in cl:
+                return f"DOWNGRADED_TIER:{req_model}->claude-sonnet"
+            if "haiku" in rm or re.search(r"\bi(?:'m|\s+am)\s+claude\s+(?:3(?:\.5)?\s+|4(?:\.5)?\s+)?haiku\b", cl) or "i'm claude-haiku" in cl:
+                return f"DOWNGRADED_TIER:{req_model}->claude-haiku"
+            if ver and ver[0] >= 5:
+                if re.search(r"\b(?:i'm|i am|understanding is that i'm)\s+claude\s+(?:3\s+opus|opus\s+4(?:\.\d+)?)\b", cl) or "claude-opus-4" in rm or "claude-3-opus" in rm:
+                    return f"DOWNGRADED_VERSION:{req_model}->claude-opus-4.x"
+        elif tier == "sonnet" and ver and ver >= (4, 5):
+            if re.search(r"\bi(?:'m|\s+am)\s+claude\s+3\.(?:5|7)\s+sonnet\b", cl) or "claude-3-5-sonnet" in rm or "claude-3-7-sonnet" in rm:
+                return f"DOWNGRADED_VERSION:{req_model}->claude-3.x-sonnet"
+    elif "deepseek" in m and ("v4" in m or "r2" in m):
+        if re.search(r"\bi(?:'m|\s+am)\s+deepseek[- ]v3\b", cl):
+            return f"DOWNGRADED_VERSION:{req_model}->deepseek-v3"
+    return None
+
+
+def _detect_stylistic_spoof(req_model: str, content: str | None, wrapper: str | None = None) -> str | None:
+    """Catch OpenAI gpt-4o-mini wearing a Claude system prompt via \\( \\)/\\[ \\] LaTeX delimiter habit."""
+    if not req_model or not content or wrapper == "kiro":
+        return None
+    m = req_model.lower()
+    if "claude" not in m and not any(m.startswith(p) for p in ("opus-", "sonnet-", "haiku-")):
+        return None
+    uses_openai_latex = ("\\(" in content and "\\)" in content) or ("\\[" in content and "\\]" in content)
+    if not uses_openai_latex:
+        return None
+    cl = content.lower()
+    # Check if negative constraint ('like' or 'similar') was violated or if inline quadratic formula was rendered with \( \)
+    violated = bool(re.search(r"\b(?:like|similar|similarly|similarity)\b", cl))
+    if violated or "\\frac{-b" in content or "b^2" in content:
+        return f"openai_latex_on_claude(constraint_violated={violated})"
+    return None
 
 
 def _is_frontier_spoof(req_model: str, resp_model: str | None) -> bool:
@@ -570,8 +692,18 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=1
         res1 = res1 if isinstance(res1, dict) else {}
         c1 = _strip_prompt_echo(res1.get("content", ""), p1_prompt)
         raw_c1 = res1.get("raw_content", "") or c1
-        if _is_frontier_spoof(model, res1.get("resp_model")) or _is_pretender_content(model, c1):
-            checks["model_echo_mismatch"] = f"{model}->{res1.get('resp_model') or 'prose_pretender'}"
+        hp1 = _detect_honeypot(c1) or _detect_honeypot(raw_c1)
+        if hp1:
+            checks["honeypot_detected"] = hp1
+        wrap1 = _detect_legitimate_wrapper(model, c1, res1.get("prompt_tokens"))
+        if wrap1:
+            checks["legitimate_wrapper"] = wrap1
+        if checks.get("legitimate_wrapper") != "kiro":
+            if _is_frontier_spoof(model, res1.get("resp_model")) or _is_pretender_content(model, c1):
+                checks["model_echo_mismatch"] = f"{model}->{res1.get('resp_model') or 'prose_pretender'}"
+            dg1 = _detect_tier_or_version_downgrade(model, c1, res1.get("resp_model"))
+            if dg1:
+                checks["tier_or_version_downgrade"] = dg1
         if c1.strip() and not check_stub(c1):
             score += 1
             checks[p1_name] = "pass"
@@ -623,8 +755,22 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=1
         if st == 200:
             raw_content = res.get("content", "") if isinstance(res, dict) else ""
             content = _strip_prompt_echo(raw_content, prompt)
-            if _is_frontier_spoof(model, res.get("resp_model")) or _is_pretender_content(model, content):
-                checks["model_echo_mismatch"] = f"{model}->{res.get('resp_model') or 'prose_pretender'}"
+            hp = _detect_honeypot(content) or _detect_honeypot(raw_content)
+            if hp:
+                checks["honeypot_detected"] = hp
+            wrap = _detect_legitimate_wrapper(model, content, res.get("prompt_tokens"))
+            if wrap and not checks.get("legitimate_wrapper"):
+                checks["legitimate_wrapper"] = wrap
+            if checks.get("legitimate_wrapper") != "kiro":
+                if _is_frontier_spoof(model, res.get("resp_model")) or _is_pretender_content(model, content):
+                    checks["model_echo_mismatch"] = f"{model}->{res.get('resp_model') or 'prose_pretender'}"
+                dg = _detect_tier_or_version_downgrade(model, content, res.get("resp_model"))
+                if dg:
+                    checks["tier_or_version_downgrade"] = dg
+                if name == "creative_short":
+                    st_spoof = _detect_stylistic_spoof(model, content, checks.get("legitimate_wrapper"))
+                    if st_spoof:
+                        checks["stylistic_spoof"] = st_spoof
             if content.strip() and not check_stub(content):
                 score += 1
                 checks[name] = "pass"
@@ -722,7 +868,9 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=1
         checks["topic_fidelity"] = "429_active_relay"
         score += 1
 
-    if checks.get("model_echo_mismatch"):
+    if checks.get("honeypot_detected"):
+        return {"model": model, "score": 0, "tier": "FAKE_HONEYPOT", "checks": checks}
+    if checks.get("model_echo_mismatch") or checks.get("tier_or_version_downgrade") or checks.get("stylistic_spoof"):
         return {"model": model, "score": score, "tier": "FAKE_MODEL_SPOOF", "checks": checks}
     if checks.get("variance") == "IDENTICAL_REPLAY_SUSPECT" or str(checks.get("arithmetic", "")).startswith("wrong_answer:"):
         return {"model": model, "score": 0, "tier": "FAKE_CANNED_STUB", "checks": checks}
@@ -1287,6 +1435,23 @@ async def validate_host(session, host, timeout, max_models, sem, ledger_fp=None,
                     results.append({"model": m, "score": 0, "tier": "HOST_BUDGET_EXHAUSTED", "checks": {}})
 
         working = [r for r in results if r["tier"] in ("GOLD", "SILVER")]
+        # Host-level Honeypot Poison Pill (2026-11-06):
+        # Multi-port honeypots advertise gpt-4o alongside claude-opus-5-5:latest.
+        # If ANY model on the host confesses a rotating honeypot signature (Open WebUI,
+        # LiteLLM, KoboldCpp, text-generation-webui, AnythingLLM, LM Studio, vLLM, LocalAI),
+        # poison the entire host so sibling models on the same honeypot are never wired.
+        honeypot_hits = [
+            r for r in results
+            if r.get("tier") == "FAKE_HONEYPOT" or (r.get("checks") or {}).get("honeypot_detected")
+        ]
+        if honeypot_hits:
+            hp_reason = (honeypot_hits[0].get("checks") or {}).get("honeypot_detected") or "honeypot_host"
+            for r in working:
+                r["tier"] = "FAKE_HONEYPOT_SIBLING"
+                r["score"] = 0
+                if isinstance(r.get("checks"), dict):
+                    r["checks"]["host_honeypot_poisoned"] = hp_reason
+            working = []
         # Cross-model byte-identical replay guard (model-authenticity-triage Rule #5):
         # If >=3 models on the same host return the exact same non-empty creative prose sample
         # (never code like fizzbuzz, which can canonically match), the host is a canned stub.
@@ -1304,7 +1469,9 @@ async def validate_host(session, host, timeout, max_models, sem, ledger_fp=None,
         partial = [r for r in results if r["tier"] == "EMPTY_CONTENT_ALIVE"]
         exhausted = [r for r in results if r["tier"] == "HOST_BUDGET_EXHAUSTED"]
 
-        if any(r["tier"] == "GOLD" for r in results):
+        if honeypot_hits:
+            host_tier = "FAKE_HONEYPOT_HOST"
+        elif any(r["tier"] == "GOLD" for r in results):
             host_tier = "GOLD"
         elif working:
             host_tier = "SILVER"
