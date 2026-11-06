@@ -55,7 +55,9 @@ jobs:
           sudo masscan -iL "$F" -p${{ github.event.inputs.ports }} \
             --rate ${{ github.event.inputs.rate }} \
             --wait 3 -oJ "hits_${SHARD_ID}.json" || true
+          sudo chmod a+rw "hits_${SHARD_ID}.json" 2>/dev/null || true
           if [ ! -s "hits_${SHARD_ID}.json" ]; then
+            sudo rm -f "hits_${SHARD_ID}.json" || true
             echo "[]" > "hits_${SHARD_ID}.json"
           fi
           echo "raw hits: $(grep -c '\"ip\"' hits_${SHARD_ID}.json 2>/dev/null || echo 0)"
