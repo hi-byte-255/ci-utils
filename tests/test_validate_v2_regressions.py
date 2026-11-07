@@ -258,3 +258,64 @@ def test_adversarial_honeypot_downgrade_stylistic_and_kiro_whitelist():
     ) is None
 
 
+def test_multi_format_completion_extraction_and_endpoint_fallback():
+    """Verify Anthropic /v1/messages, OpenAI /v1/responses, Gemini candidates, flat JSON, SSE, and endpoint fallback."""
+    # 1. Anthropic /v1/messages JSON with thinking + text
+    anth_body = {
+        "id": "msg_01",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-opus-4-6",
+        "content": [
+            {"type": "thinking", "thinking": "Let me calculate 17 * 23 = 391."},
+            {"type": "text", "text": "391"},
+        ],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 24, "output_tokens": 18},
+    }
+    ext_a = v._extract_completion_fields(anth_body)
+    assert ext_a is not None
+    assert ext_a["content"] == "391"
+    assert "391" in ext_a["raw_msg"]["reasoning_content"]
+    assert ext_a["prompt_tokens"] == 24
+    assert ext_a["resp_model"] == "claude-opus-4-6"
+
+    # 2. OpenAI /v1/responses JSON
+    resp_body = {
+        "id": "resp_01",
+        "object": "response",
+        "model": "gpt-5.4",
+        "status": "completed",
+        "output": [
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Multiplying 17 by 23."}]},
+            {"type": "message", "content": [{"type": "output_text", "text": "The product is 391."}]},
+        ],
+        "usage": {"input_tokens": 19, "output_tokens": 12},
+    }
+    ext_r = v._extract_completion_fields(resp_body)
+    assert ext_r is not None
+    assert "391" in ext_r["content"]
+    assert "Multiplying" in ext_r["raw_msg"]["reasoning_content"]
+    assert ext_r["prompt_tokens"] == 19
+
+    # 3. Error envelope with data: null must NOT be treated as completion or unlisted model list
+    err_env = {"code": 50401, "type": "error", "message": "not authentication", "data": None}
+    assert v._extract_completion_fields(err_env) is None
+
+    # 4. Anthropic SSE fallback
+    anth_sse = (
+        'event: message_start\n'
+        'data: {"type":"message_start","message":{"id":"msg_1","model":"claude-sonnet-4-6","usage":{"input_tokens":15}}}\n\n'
+        'event: content_block_delta\n'
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"thinking step"}}\n\n'
+        'event: content_block_delta\n'
+        'data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"def fizzbuzz(n): return str(n)"}}\n\n'
+    )
+    sse_a = v._parse_sse_fallback(anth_sse)
+    assert sse_a is not None
+    assert "def fizzbuzz" in sse_a["content"]
+    assert sse_a["prompt_tokens"] == 15
+    assert sse_a["resp_model"] == "claude-sonnet-4-6"
+
+
+
