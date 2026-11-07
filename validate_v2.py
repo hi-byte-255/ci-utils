@@ -125,7 +125,7 @@ STUB_MARKERS = [
     "canarytoken", "webhook.site", "oastify.com", "burpcollaborator", "requestbin",
 ]
 
-THINK_STRIP_RE = re.compile(r"<think(?:ing)?>.*?</think(?:ing)?>\s*", re.DOTALL | re.IGNORECASE)
+THINK_STRIP_RE = re.compile(r"(?:<think(?:ing)?>|\A).*?</think(?:ing)?>\s*", re.DOTALL | re.IGNORECASE)
 
 
 def strip_thinking(text: str) -> str:
@@ -163,11 +163,184 @@ def _strip_prompt_echo(text: str, prompt: str) -> str:
     return cleaned.strip()
 
 
+def _extract_completion_fields(body: dict) -> dict | None:
+    """Universal completion extractor across OpenAI chat, Anthropic /v1/messages,
+    OpenAI /v1/responses, legacy /v1/completions, Gemini candidates, and flat response JSON."""
+    if not isinstance(body, dict):
+        return None
+    # Reject explicit error envelopes (e.g. {"code": 50401, "type": "error", "data": null} or {"code": 404, "msg": ...})
+    if body.get("type") == "error" or (isinstance(body.get("error"), (dict, str)) and body.get("error")):
+        return None
+    err_code = body.get("code")
+    if isinstance(err_code, int) and err_code != 0 and err_code != 200 and "choices" not in body and "content" not in body:
+        return None
+
+    content_parts, reasoning_parts, tc_names = [], [], []
+    finish_reason = None
+    resp_model = body.get("model") if isinstance(body.get("model"), str) else None
+    _usage = body.get("usage")
+    usage = _usage if isinstance(_usage, dict) else {}
+    prompt_tokens = usage.get("prompt_tokens")
+    if prompt_tokens is None:
+        prompt_tokens = usage.get("input_tokens")
+    _ef = body.get("extra_fields")
+    ef = _ef if isinstance(_ef, dict) else {}
+    header_leak = "provider_response_headers" in ef
+    matched_shape = False
+
+    # 1. OpenAI chat.completion / text completion (choices[])
+    choices = body.get("choices")
+    if isinstance(choices, list) and len(choices) > 0 and isinstance(choices[0], dict):
+        matched_shape = True
+        ch0: dict = choices[0]
+        finish_reason = ch0.get("finish_reason") or ch0.get("stop_reason")
+        raw_m_obj = ch0.get("message")
+        raw_d_obj = ch0.get("delta")
+        msg: dict = raw_m_obj if isinstance(raw_m_obj, dict) else (
+            raw_d_obj if isinstance(raw_d_obj, dict) else {}
+        )
+        raw_c = msg.get("content")
+        if isinstance(raw_c, str):
+            content_parts.append(raw_c)
+        elif isinstance(raw_c, list):
+            for blk in raw_c:
+                if isinstance(blk, dict):
+                    btype = blk.get("type", "")
+                    if btype in ("thinking", "reasoning"):
+                        reasoning_parts.append(str(blk.get("thinking") or blk.get("text") or ""))
+                    elif blk.get("text") or blk.get("content"):
+                        content_parts.append(str(blk.get("text") or blk.get("content") or ""))
+                elif isinstance(blk, str):
+                    content_parts.append(blk)
+        ch0_text = ch0.get("text")
+        if not content_parts and isinstance(ch0_text, str):
+            content_parts.append(ch0_text)
+        raw_r = (
+            msg.get("reasoning_content")
+            or msg.get("reasoning")
+            or msg.get("thinking")
+            or msg.get("reasoning_text")
+            or ch0.get("reasoning_content")
+            or ""
+        )
+        if isinstance(raw_r, str) and raw_r:
+            reasoning_parts.append(raw_r)
+        raw_tcs = msg.get("tool_calls")
+        tcs: list = raw_tcs if isinstance(raw_tcs, list) else []
+        for c in tcs:
+            if isinstance(c, dict):
+                raw_fn = c.get("function")
+                fn: dict = raw_fn if isinstance(raw_fn, dict) else {}
+                name = fn.get("name") or c.get("name")
+                if name:
+                    tc_names.append(str(name))
+
+    # 2. Anthropic /v1/messages (type == "message" or top-level content: list)
+    elif body.get("type") == "message" or isinstance(body.get("content"), list):
+        matched_shape = True
+        finish_reason = body.get("stop_reason") or body.get("finish_reason")
+        raw_blocks = body.get("content")
+        blocks: list = raw_blocks if isinstance(raw_blocks, list) else []
+        for blk in blocks:
+            if not isinstance(blk, dict):
+                continue
+            btype = blk.get("type", "")
+            if btype == "text" or ("text" in blk and btype not in ("thinking", "redacted_thinking")):
+                if blk.get("text"):
+                    content_parts.append(str(blk["text"]))
+            elif btype in ("thinking", "redacted_thinking"):
+                if blk.get("thinking") or blk.get("text"):
+                    reasoning_parts.append(str(blk.get("thinking") or blk.get("text")))
+            elif btype in ("tool_use", "server_tool_use"):
+                if blk.get("name"):
+                    tc_names.append(str(blk["name"]))
+
+    # 3. OpenAI /v1/responses (object == "response" or output: list or output_text: str)
+    elif body.get("object") == "response" or isinstance(body.get("output"), list) or isinstance(body.get("output_text"), str):
+        matched_shape = True
+        finish_reason = body.get("status") or body.get("stop_reason")
+        out_txt = body.get("output_text")
+        if isinstance(out_txt, str) and out_txt:
+            content_parts.append(out_txt)
+        raw_out = body.get("output")
+        out_items: list = raw_out if isinstance(raw_out, list) else []
+        for item in out_items:
+            if not isinstance(item, dict):
+                continue
+            itype = item.get("type", "")
+            if itype == "message":
+                for c in (item.get("content") or []):
+                    if isinstance(c, dict):
+                        ctype = c.get("type", "")
+                        if ctype in ("output_text", "text") and c.get("text"):
+                            if not out_txt:
+                                content_parts.append(str(c["text"]))
+                        elif ctype in ("reasoning", "thinking") and (c.get("text") or c.get("thinking")):
+                            reasoning_parts.append(str(c.get("text") or c.get("thinking")))
+            elif itype in ("reasoning", "thinking"):
+                for s in (item.get("summary") or item.get("content") or []):
+                    if isinstance(s, dict) and (s.get("text") or s.get("thinking")):
+                        reasoning_parts.append(str(s.get("text") or s.get("thinking")))
+                item_txt = item.get("text")
+                if isinstance(item_txt, str) and item_txt:
+                    reasoning_parts.append(item_txt)
+            elif itype in ("function_call", "custom_tool_call", "tool_call"):
+                if item.get("name"):
+                    tc_names.append(str(item["name"]))
+            elif isinstance(item.get("text"), str) and not content_parts:
+                content_parts.append(str(item["text"]))
+
+    # 4. Google Gemini / Vertex generateContent (candidates[])
+    elif isinstance(body.get("candidates"), list) and body["candidates"] and isinstance(body["candidates"][0], dict):
+        matched_shape = True
+        cand0: dict = body["candidates"][0]
+        finish_reason = cand0.get("finishReason")
+        raw_cobj = cand0.get("content")
+        c_obj: dict = raw_cobj if isinstance(raw_cobj, dict) else {}
+        for part in (c_obj.get("parts") or []):
+            if isinstance(part, dict):
+                if part.get("thought") is True and part.get("text"):
+                    reasoning_parts.append(str(part["text"]))
+                elif part.get("text"):
+                    content_parts.append(str(part["text"]))
+                fc = part.get("functionCall")
+                if isinstance(fc, dict) and fc.get("name"):
+                    tc_names.append(str(fc["name"]))
+
+    # 5. Flat completion JSON (Ollama /api/generate "response", Cohere "text", or top-level string "content")
+    elif isinstance(body.get("response"), str) or isinstance(body.get("content"), str) or isinstance(body.get("output"), str):
+        matched_shape = True
+        raw_flat = body.get("response") if isinstance(body.get("response"), str) else (
+            body.get("content") if isinstance(body.get("content"), str) else body.get("output", "")
+        )
+        content_parts.append(str(raw_flat))
+        if isinstance(body.get("thinking"), str) and body["thinking"]:
+            reasoning_parts.append(body["thinking"])
+
+    if not matched_shape:
+        return None
+
+    content = "".join(content_parts)
+    reasoning = "".join(reasoning_parts)
+    full_text = (strip_thinking(content) or reasoning).strip()
+    return {
+        "content": full_text,
+        "raw_msg": {"content": content, "reasoning_content": reasoning},
+        "raw_content": content,
+        "resp_model": resp_model,
+        "tool_calls": tc_names,
+        "finish_reason": finish_reason,
+        "prompt_tokens": prompt_tokens,
+        "header_leak": header_leak,
+    }
+
+
 def _parse_sse_fallback(raw_txt: str) -> dict | None:
-    """Parse SSE 'data: {...}' chunks when a gateway forces streaming on a stream=False call."""
+    """Parse SSE 'data: {...}' chunks across OpenAI chat/text, Anthropic /v1/messages, and OpenAI /v1/responses."""
     if not raw_txt or "data:" not in raw_txt:
         return None
-    parts, reasoning_parts, resp_model, msg_id = [], [], None, None
+    parts, reasoning_parts, tc_names = [], [], []
+    resp_model, msg_id, prompt_tokens = None, None, None
     for raw_line in raw_txt.splitlines():
         line = raw_line.strip()
         if not line.startswith("data:"):
@@ -183,18 +356,88 @@ def _parse_sse_fallback(raw_txt: str) -> dict | None:
             continue
         resp_model = resp_model or obj.get("model")
         msg_id = msg_id or obj.get("id")
+        if isinstance(obj.get("usage"), dict) and prompt_tokens is None:
+            prompt_tokens = obj["usage"].get("prompt_tokens") or obj["usage"].get("input_tokens")
+
+        # Anthropic SSE: message_start / content_block_delta / content_block_start
+        ev_type = obj.get("type", "")
+        if ev_type == "message_start" and isinstance(obj.get("message"), dict):
+            m_obj = obj["message"]
+            resp_model = resp_model or m_obj.get("model")
+            msg_id = msg_id or m_obj.get("id")
+            if isinstance(m_obj.get("usage"), dict) and prompt_tokens is None:
+                prompt_tokens = m_obj["usage"].get("input_tokens") or m_obj["usage"].get("prompt_tokens")
+            continue
+        if ev_type == "content_block_start" and isinstance(obj.get("content_block"), dict):
+            cb = obj["content_block"]
+            if cb.get("type") == "tool_use" and cb.get("name"):
+                tc_names.append(str(cb["name"]))
+            elif cb.get("type") == "text" and cb.get("text"):
+                parts.append(str(cb["text"]))
+            elif cb.get("type") == "thinking" and cb.get("thinking"):
+                reasoning_parts.append(str(cb["thinking"]))
+            continue
+        if ev_type == "content_block_delta" and isinstance(obj.get("delta"), dict):
+            d = obj["delta"]
+            dtype = d.get("type", "")
+            if dtype == "text_delta" or ("text" in d and dtype != "thinking_delta"):
+                if d.get("text"):
+                    parts.append(str(d["text"]))
+            elif dtype == "thinking_delta" or "thinking" in d:
+                if d.get("thinking"):
+                    reasoning_parts.append(str(d["thinking"]))
+            continue
+
+        # OpenAI /v1/responses SSE: response.output_text.delta / response.reasoning_summary_text.delta
+        if ev_type in ("response.output_text.delta", "response.text.delta") and isinstance(obj.get("delta"), str):
+            parts.append(obj["delta"])
+            continue
+        if ev_type in ("response.reasoning_summary_text.delta", "response.reasoning.delta", "response.thinking.delta") and isinstance(obj.get("delta"), str):
+            reasoning_parts.append(obj["delta"])
+            continue
+        if ev_type == "response.completed" and isinstance(obj.get("response"), dict):
+            ext = _extract_completion_fields(obj["response"])
+            if ext:
+                if not parts and ext["raw_content"]:
+                    parts.append(ext["raw_content"])
+                if not reasoning_parts and ext["raw_msg"].get("reasoning_content"):
+                    reasoning_parts.append(ext["raw_msg"]["reasoning_content"])
+                resp_model = resp_model or ext.get("resp_model")
+                if prompt_tokens is None:
+                    prompt_tokens = ext.get("prompt_tokens")
+            continue
+
+        # OpenAI Chat / Text Completions SSE (choices[0].delta / message / text)
         choices = obj.get("choices")
         if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-            ch0 = choices[0]
-            delta = ch0.get("delta") if isinstance(ch0.get("delta"), dict) else {}
-            msg = ch0.get("message") if isinstance(ch0.get("message"), dict) else {}
-            c_piece = delta.get("content") or msg.get("content") or ""
-            r_piece = delta.get("reasoning_content") or msg.get("reasoning_content") or ""
-            if c_piece:
-                parts.append(str(c_piece))
-            if r_piece:
-                reasoning_parts.append(str(r_piece))
-    if not parts and not reasoning_parts:
+            ch0: dict = choices[0]
+            raw_d = ch0.get("delta")
+            raw_m = ch0.get("message")
+            delta: dict = raw_d if isinstance(raw_d, dict) else {}
+            msg: dict = raw_m if isinstance(raw_m, dict) else {}
+            c_piece = delta.get("content") or msg.get("content") or ch0.get("text") or ""
+            r_piece = (
+                delta.get("reasoning_content")
+                or delta.get("reasoning")
+                or delta.get("thinking")
+                or msg.get("reasoning_content")
+                or msg.get("reasoning")
+                or msg.get("thinking")
+                or ""
+            )
+            if isinstance(c_piece, str) and c_piece:
+                parts.append(c_piece)
+            if isinstance(r_piece, str) and r_piece:
+                reasoning_parts.append(r_piece)
+            tcs = delta.get("tool_calls") or msg.get("tool_calls") or []
+            if isinstance(tcs, list):
+                for c in tcs:
+                    if isinstance(c, dict):
+                        raw_fn = c.get("function")
+                        fn: dict = raw_fn if isinstance(raw_fn, dict) else {}
+                        if fn.get("name"):
+                            tc_names.append(str(fn["name"]))
+    if not parts and not reasoning_parts and not tc_names:
         return None
     content = "".join(parts)
     reasoning = "".join(reasoning_parts)
@@ -205,9 +448,9 @@ def _parse_sse_fallback(raw_txt: str) -> dict | None:
         "raw_msg": {"content": content, "reasoning_content": reasoning},
         "raw_content": content,
         "resp_model": resp_model,
-        "tool_calls": [],
+        "tool_calls": tc_names,
         "finish_reason": "stop",
-        "prompt_tokens": None,
+        "prompt_tokens": prompt_tokens,
         "header_leak": False,
         "forced_sse": True,
     }
@@ -217,28 +460,80 @@ def is_chat_model(m_name: str) -> bool:
     return not any(k in low for k in NON_CHAT_KEYWORDS)
 
 
-async def chat(session, base, chat_path, model, prompt, timeout, stream=False, max_tokens=2048, headers=None, extra_payload=None):
-    """One chat call. Returns dict(status, content, ttft, chunks, elapsed) or error info."""
-    t0 = time.time()
+def _build_completion_request(chat_path: str, model: str, prompt: str, max_tokens: int, stream: bool, headers: dict | None, extra_payload: dict | None):
+    """Build (payload, req_headers) tailored to the target completion endpoint kind."""
+    req_headers = dict(headers) if isinstance(headers, dict) else {}
+    cp = (chat_path or "/v1/chat/completions").rstrip("/")
+    if cp.endswith("/messages"):
+        # Anthropic /v1/messages native format
+        req_headers.setdefault("anthropic-version", "2023-06-01")
+        auth_val = req_headers.get("Authorization", "")
+        bearer_tok = auth_val[7:].strip() if auth_val.lower().startswith("bearer ") else ""
+        req_headers.setdefault("x-api-key", bearer_tok or "sk-ant-api03-1234567890")
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "stream": stream,
+        }
+        if extra_payload:
+            for k, v in extra_payload.items():
+                if k not in ("reasoning_effort", "enable_thinking"):
+                    payload[k] = v
+        return payload, (req_headers or None)
+    if cp.endswith("/responses"):
+        # OpenAI /v1/responses format
+        payload = {
+            "model": model,
+            "input": prompt,
+            "max_output_tokens": max_tokens,
+            "stream": stream,
+        }
+        if extra_payload:
+            for k, v in extra_payload.items():
+                if k == "reasoning_effort":
+                    payload["reasoning"] = {"effort": v}
+                elif k != "enable_thinking":
+                    payload[k] = v
+        return payload, (req_headers or None)
+    if cp.endswith("/v1/completions") or cp == "/completions":
+        # Legacy text completions format
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "stream": stream,
+        }
+        if extra_payload:
+            payload.update(extra_payload)
+        return payload, (req_headers or None)
+    # Default: OpenAI /v1/chat/completions format
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
-        "stream": stream
+        "stream": stream,
     }
     if extra_payload:
         payload.update(extra_payload)
+    return payload, (req_headers or None)
+
+
+async def chat(session, base, chat_path, model, prompt, timeout, stream=False, max_tokens=2048, headers=None, extra_payload=None):
+    """One completion call across OpenAI chat, Anthropic /v1/messages, OpenAI /v1/responses, or /v1/completions."""
+    t0 = time.time()
+    payload, req_headers = _build_completion_request(chat_path, model, prompt, max_tokens, stream, headers, extra_payload)
     url = f"{base}{chat_path}"
     # Initialize streaming vars outside try so outer except can check them
     ttft, chunks, text = None, 0, []
     try:
         async with asyncio.timeout(timeout):
             if not stream:
-                async with session.post(url, json=payload, headers=headers,
+                async with session.post(url, json=payload, headers=req_headers,
                                         timeout=aiohttp.ClientTimeout(total=timeout, connect=CONNECT_TIMEOUT)) as r:
                     if r.status != 200:
                         err_txt = ""
-                        if r.status in (400, 502, 503):
+                        if r.status in (400, 404, 405, 500, 502, 503):
                             try:
                                 err_txt = (await r.text())[:240]
                             except Exception:
@@ -258,44 +553,18 @@ async def chat(session, base, chat_path, model, prompt, timeout, stream=False, m
                         return {"status": "bad_json"}
                     if isinstance(body, dict) and (body.get("id") == "chatcmpl-12c423" or body.get("created") == 1677858242):
                         return {"status": 200, "content": "hello! i'm doing well, thank you", "alibaba_honeypot": True, "elapsed": time.time() - t0}
-                    choices = body.get("choices") if isinstance(body, dict) else []
-                    if not choices or not isinstance(choices, list):
+                    ext = _extract_completion_fields(body) if isinstance(body, dict) else None
+                    if ext is None:
                         return {"status": "no_choices"}
-                    ch0 = choices[0] if isinstance(choices[0], dict) else {}
-                    msg = ch0.get("message", {}) if isinstance(ch0.get("message"), dict) else {}
-                    content = msg.get("content") or ""
-                    reasoning = msg.get("reasoning_content") or ""
-                    full_text = (strip_thinking(content) or reasoning).strip()
-                    # 2026-10-09 lesson: a gateway that injects its OWN toolset answers
-                    # with tool_calls + EMPTY content. Scoring that as a stub is a FALSE
-                    # NEGATIVE — the host is alive and real, it just wants a tool run.
-                    # Capture the call names instead of discarding them.
-                    tcs = msg.get("tool_calls") if isinstance(msg.get("tool_calls"), list) else []
-                    tc_names = [c.get("function", {}).get("name") for c in tcs
-                                if isinstance(c, dict) and isinstance(c.get("function"), dict)]
-                    tc_names = [n for n in tc_names if n]
-                    # Hidden system prompt: we send NO system message, so any prompt_tokens
-                    # beyond our own payload means the gateway injected one. Observed up to
-                    # 6,708 tokens this way during the 2026-10-09 payload triage.
-                    _usage = body.get("usage")
-                    usage = _usage if isinstance(_usage, dict) else {}
-                    # Owner-ID leak: some gateways echo upstream provider headers.
-                    _ef = body.get("extra_fields")
-                    ef = _ef if isinstance(_ef, dict) else {}
-                    return {"status": 200, "content": full_text, "raw_msg": msg,
-                            "raw_content": content,
-                            "resp_model": body.get("model") if isinstance(body, dict) else None,
-                            "tool_calls": tc_names,
-                            "finish_reason": ch0.get("finish_reason"),
-                            "prompt_tokens": usage.get("prompt_tokens"),
-                            "header_leak": "provider_response_headers" in ef,
-                            "elapsed": time.time() - t0}
+                    ext["status"] = 200
+                    ext["elapsed"] = time.time() - t0
+                    return ext
 
-            # Streaming mode
+            # Streaming mode (supports OpenAI chat/text SSE, Anthropic /v1/messages SSE, and OpenAI /v1/responses SSE)
             ttft, chunks, text = None, 0, []
             done = False
             try:
-                async with session.post(url, json=payload, headers=headers,
+                async with session.post(url, json=payload, headers=req_headers,
                                         timeout=aiohttp.ClientTimeout(total=timeout, connect=CONNECT_TIMEOUT)) as r:
                     if r.status != 200:
                         return {"status": r.status}
@@ -307,8 +576,23 @@ async def chat(session, base, chat_path, model, prompt, timeout, stream=False, m
                             done = True
                             break
                         try:
-                            delta = json.loads(line[5:])["choices"][0].get("delta", {})
-                            d_text = delta.get("content") or delta.get("reasoning_content") or ""
+                            ev = json.loads(line[5:])
+                            if not isinstance(ev, dict):
+                                continue
+                            ev_type = ev.get("type", "")
+                            if ev_type in ("message_stop", "response.completed"):
+                                done = True
+                                break
+                            d_text = ""
+                            if ev_type == "content_block_delta" and isinstance(ev.get("delta"), dict):
+                                d_obj = ev["delta"]
+                                d_text = d_obj.get("text") or d_obj.get("thinking") or ""
+                            elif ev_type in ("response.output_text.delta", "response.text.delta", "response.reasoning_summary_text.delta", "response.reasoning.delta") and isinstance(ev.get("delta"), str):
+                                d_text = ev["delta"]
+                            elif isinstance(ev.get("choices"), list) and ev["choices"]:
+                                ch0 = ev["choices"][0] if isinstance(ev["choices"][0], dict) else {}
+                                delta = ch0.get("delta", {}) if isinstance(ch0.get("delta"), dict) else {}
+                                d_text = delta.get("content") or delta.get("reasoning_content") or delta.get("reasoning") or delta.get("thinking") or ch0.get("text") or ""
                         except Exception:
                             continue
                         if not d_text:
@@ -415,17 +699,20 @@ PRETENDER_PROSE_SIGNATURES = {
         "i am gemini", "i'm gemini", "trained by google", "large language model created by google",
         "helpful ai assistant developed by google",
         "i am glm", "zhipu ai", "i am llama", "nexus-7b", "ironclad-7b",
+        "i am nemotron", "i'm nemotron", "created by nvidia", "developed by nvidia",
     ),
     "gpt-": (
         "i am qwen", "i'm qwen", "created by alibaba", "developed by alibaba", "tongyi lab",
         "i am deepseek", "i'm deepseek", "developed by deepseek",
         "i am claude", "i'm claude", "created by anthropic", "made by anthropic", "developed by anthropic",
         "i am glm", "zhipu ai", "nexus-7b", "ironclad-7b",
+        "i am nemotron", "i'm nemotron", "created by nvidia", "developed by nvidia",
     ),
     "gemini": (
         "i am qwen", "created by alibaba", "i am deepseek", "developed by deepseek",
         "i am chatgpt", "trained by openai", "i am claude", "created by anthropic",
         "i am glm", "nexus-7b", "ironclad-7b",
+        "i am nemotron", "i'm nemotron", "created by nvidia", "developed by nvidia",
     ),
     "deepseek": (
         "i am claude", "i'm claude", "made by anthropic", "created by anthropic", "developed by anthropic",
@@ -685,6 +972,47 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=1
             st1 = 200
             checks["reasoning_effort_none"] = True
 
+    # Bifrost / router explicit provider prefix adaptive retry on 400 ("specify a provider")
+    if st1 == 400 and ("provider" in err_body.lower() or "invalid model" in err_body.lower()) and "/" not in active_model:
+        ml = active_model.lower()
+        pref = "anthropic" if "claude" in ml else ("google" if "gemini" in ml else ("deepseek" if "deepseek" in ml else "openai"))
+        cand_m = f"{pref}/{active_model}"
+        res_pr = await chat(session, base, chat_path, cand_m, p1_prompt, timeout, headers=headers, extra_payload=active_extra)
+        if res_pr.get("status") == 200:
+            active_model = cand_m
+            res1 = res_pr
+            st1 = 200
+            checks["provider_prefix_bypass"] = cand_m
+
+    # Small context / max_tokens=2048 rejection retry on 400 (e.g. LM Studio / local vLLM with tight n_ctx)
+    if st1 == 400:
+        res_mt = await chat(session, base, chat_path, active_model, p1_prompt, timeout, max_tokens=256, headers=headers, extra_payload=active_extra)
+        if res_mt.get("status") == 200:
+            res1 = res_mt
+            st1 = 200
+            checks["low_max_tokens_retry"] = 256
+
+    # Multi-format completion endpoint fallback (/v1/messages, /v1/responses, /chat/completions, /api/v1/chat/completions, /v1/completions)
+    if st1 in (404, 405, "no_choices") or (
+        st1 == 400 and any(k in err_body.lower() for k in ("responses", "messages", "endpoint", "not found", "unsupported"))
+    ):
+        is_claude_fam = any(k in active_model.lower() for k in ("claude", "anthropic"))
+        alt_paths = (
+            ["/v1/messages", "/api/v1/messages", "/v1/responses", "/chat/completions", "/api/v1/chat/completions", "/v1/completions"]
+            if is_claude_fam
+            else ["/v1/responses", "/v1/messages", "/chat/completions", "/api/v1/chat/completions", "/v1/completions"]
+        )
+        for alt_cp in alt_paths:
+            if alt_cp == chat_path:
+                continue
+            res_alt = await chat(session, base, alt_cp, active_model, p1_prompt, timeout, headers=headers, extra_payload=active_extra)
+            if res_alt.get("status") == 200:
+                chat_path = alt_cp
+                res1 = res_alt
+                st1 = 200
+                checks["resolved_chat_path"] = alt_cp
+                break
+
     model = active_model
     extra_payload = active_extra
 
@@ -911,7 +1239,12 @@ async def probe_path_fast(session, base, m_path, c_path, headers=None):
                             m_list.extend([str(k) for k in data.keys() if k != "data"])
                     if m_list:
                         return (m_path, c_path, list(dict.fromkeys(m_list)))
-                    if isinstance(data, dict) and ("data" in data or "models" in data):
+                    if (
+                        isinstance(data, dict)
+                        and not data.get("error")
+                        and data.get("type") != "error"
+                        and (isinstance(data.get("data"), list) or isinstance(data.get("models"), list))
+                    ):
                         return (m_path, c_path, list(UNLISTED_CANARY_MODELS))
                 elif r.status in (401, 403) and headers is None and m_path == "/v1/models":
                     for tk in DEFAULT_TEMPLATE_KEYS:
@@ -1411,10 +1744,14 @@ async def validate_host(session, host, timeout, max_models, sem, ledger_fp=None,
         # Step 2: adaptive in-host concurrency (MODEL_SEM_START → MODEL_SEM_MAX once the
         # host proves fast and 429-free; a slow/throttled router keeps the safe width).
         model_sem = AdaptiveSem(MODEL_SEM_START, MODEL_SEM_MAX, MODEL_SEM_FAST_S)
+        active_host_chat = [discovered_chat]
         async def run_m(m):
             async with model_sem:
                 t_m = time.time()
-                r = await validate_model(session, base, discovered_chat, m, timeout, headers=auth_headers)
+                r = await validate_model(session, base, active_host_chat[0], m, timeout, headers=auth_headers)
+                rcp = (r.get("checks") or {}).get("resolved_chat_path")
+                if rcp and active_host_chat[0] == discovered_chat:
+                    active_host_chat[0] = rcp
                 model_sem.observe(time.time() - t_m, hit_429="429_active_relay" in str(r.get("checks") or {}))
                 return r
 
@@ -1514,7 +1851,7 @@ async def validate_host(session, host, timeout, max_models, sem, ledger_fp=None,
             "ip": ip,
             "port": port,
             "endpoint_path": discovered_path,
-            "chat_path": discovered_chat,
+            "chat_path": active_host_chat[0],
             "tier": host_tier,
             "total_models": len(raw_models),
             "tested_models_count": len(results),
