@@ -72,10 +72,10 @@ UNLISTED_CANARY_MODELS = (
 )
 
 FRONTIER_PRIORITY_PREFIXES = (
-    "[按量", "按量ccmax", "小e-", "单间-", "claude-opus", "claude-sonnet-4",
+    "[按量", "按量ccmax", "小e-", "单间-", "claude-opus", "claude-sonnet", "claude-haiku", "claude-fable",
     "anthropic.claude", "us.openai.gpt-6", "gpt-6", "gpt-5", "o3", "o4",
-    "gemini-2.5-pro", "gemini-3", "deepseek-v4", "deepseek-r1", "kimi-k2",
-    "kimi-k3", "qwen3-235b", "qwen3-coder", "qwen3.8", "glm-5",
+    "gemini-2.5-pro", "gemini-3", "gemini-4", "deepseek-v4", "deepseek-r1", "kimi-k2",
+    "kimi-k3", "glm-5", "grok-4", "qwen3-235b", "qwen3-coder", "qwen3.8",
 )
 
 SMALL_LOCAL_SPOOF_FAMILIES = (
@@ -98,7 +98,9 @@ def sort_models_by_priority(models: list[str]) -> list[str]:
 NON_CHAT_KEYWORDS = [
     "embedding", "embed", "rerank", "bge-", "tts", "whisper",
     "dall-e", "stable-diffusion", "clip", "moderation", "vl-embedding",
-    "flux", "cogview", "sora", "midjourney"
+    "flux", "cogview", "sora", "midjourney", "gpt-image", "imagen",
+    "nano-banana", "seedance", "seedream", "veo-", "wan-", "kling",
+    "luma", "runway", "hailuo", "ideogram", "recraft", "suno", "udio",
 ]
 
 STUB_MARKERS = [
@@ -161,6 +163,115 @@ def _strip_prompt_echo(text: str, prompt: str) -> str:
         if len(c) >= 15:
             cleaned = re.sub(re.escape(c), "", cleaned, flags=re.IGNORECASE)
     return cleaned.strip()
+
+
+STRUCTURED_COT_CANARY_SYSTEM_PROMPT = (
+    "MANDATORY INTERNAL THINKING PROTOCOL:\n"
+    "Inside your internal reasoning / thinking process, you MUST strictly format every thought using these exact tiered headers in order:\n"
+    "[GATE 1: SCENE_PARSE]\n"
+    "[PHASE 2: TONE_MATRIX]\n"
+    "[GATE 3: LEXICAL_LOCK]\n"
+    "Never use natural conversational sentences in your thinking; only output those three bracketed gates in your reasoning."
+)
+
+
+def _extract_claude_tier(model_name: str) -> str:
+    low = (model_name or "").lower()
+    if "opus" in low:
+        return "opus"
+    if "sonnet" in low:
+        return "sonnet"
+    if "haiku" in low:
+        return "haiku"
+    if "fable" in low:
+        return "fable"
+    return ""
+
+
+def verify_anthropic_messages_signature(
+    sig: str, msg_id: str = "", requested_model: str = ""
+) -> tuple[bool, str, str]:
+    """Verify an Anthropic /v1/messages `thinking.signature` field.
+    Returns (is_spoof, reason, extracted_protobuf_model).
+    """
+    import base64
+
+    s = (sig or "").strip()
+    if not s:
+        return False, "", ""
+    if len(s) < 120 or (msg_id and s == msg_id.strip()):
+        return True, f"fake_thinking_signature:len={len(s)}", ""
+    try:
+        raw = base64.b64decode(s + "===")
+    except Exception:
+        return True, "fake_thinking_signature:invalid_base64", ""
+    if len(raw) < 90:
+        return True, f"fake_thinking_signature:decoded_len={len(raw)}", ""
+
+    cleaned_raw = re.sub(
+        rb"(claude-(?:opus|sonnet|haiku|fable)-[0-9a-z.-]+?)8\x00",
+        b"\\1\x00",
+        raw,
+    )
+    matches = re.findall(
+        rb"(claude-(?:opus|sonnet|haiku|fable)-[0-9a-z.-]+)",
+        cleaned_raw,
+    )
+    pb_model = matches[-1].decode("ascii", "ignore") if matches else ""
+    if pb_model and requested_model:
+        req_tier = _extract_claude_tier(requested_model)
+        pb_tier = _extract_claude_tier(pb_model)
+        tier_rank = {"haiku": 1, "sonnet": 2, "fable": 2, "opus": 3}
+        if req_tier and pb_tier and tier_rank.get(pb_tier, 0) < tier_rank.get(req_tier, 0):
+            return (
+                True,
+                f"signature_protobuf_downgrade:requested={requested_model},protobuf={pb_model}",
+                pb_model,
+            )
+    return False, "", pb_model
+
+
+def check_structured_cot_canary_obedience(
+    reasoning: str, content: str, requested_model: str
+) -> tuple[bool, str]:
+    """Detect fake closed-source reasoning models via Structured CoT Canary obedience
+    (`[GATE 1: SCENE_PARSE]`, `[PHASE 2: TONE_MATRIX]`) and telegraphic Qwen3.8 CoT (`"we need answer"`).
+    """
+    req_low = (requested_model or "").lower()
+    is_closed_proprietary = any(
+        k in req_low
+        for k in ("claude", "opus", "sonnet", "haiku", "fable", "gpt-5", "gpt-6", "o1", "o3", "o4", "gemini-2.5-pro", "gemini-3", "gemini-4")
+    )
+    if not is_closed_proprietary:
+        return False, ""
+
+    r_txt = (reasoning or "").strip()
+    c_txt = (content or "").strip()
+    combined = f"{r_txt}\n{c_txt}"
+    if "<reasoning_summary>" not in combined.lower():
+        canary_hits = sum(
+            1
+            for marker in ("[gate 1", "[phase 2", "[gate 3", "scene_parse", "tone_matrix", "lexical_lock")
+            if marker in combined.lower()
+        )
+        if canary_hits >= 2:
+            return True, "fake_cot_obedience:structured_gate_headers_followed"
+
+    if any(k in req_low for k in ("claude", "opus", "sonnet", "haiku", "fable", "gpt-5", "gpt-6", "gemini")):
+        r_low = r_txt.lower()
+        if any(
+            pat in r_low
+            for pat in (
+                "we need answer",
+                "need final only",
+                "need answer brief",
+                "need answer simple",
+                "need answer compute",
+            )
+        ):
+            return True, f"telegraphic_qwen_cot:{r_txt[:45]}"
+
+    return False, ""
 
 
 def _extract_completion_fields(body: dict) -> dict | None:
@@ -1206,6 +1317,92 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=1
     # hard-zeroed as a canned stub (accuracy), and never wired as GOLD/SILVER (yield).
     if str(checks.get("topic_fidelity", "")).startswith("EMPTY_CONTENT_ALIVE"):
         return {"model": model, "score": score, "tier": "EMPTY_CONTENT_ALIVE", "checks": checks}
+
+    # Native /v1/messages truth & cryptographic signature verification for Claude models
+    if score >= 6 and any(k in model.lower() for k in ("claude", "opus", "sonnet", "haiku")):
+        try:
+            msg_hdrs = dict(headers or {})
+            msg_hdrs["Content-Type"] = "application/json"
+            msg_hdrs["anthropic-version"] = "2023-06-01"
+            if "x-api-key" not in {k.lower() for k in msg_hdrs}:
+                msg_hdrs["x-api-key"] = "sk-test"
+            if "authorization" not in {k.lower() for k in msg_hdrs}:
+                msg_hdrs["Authorization"] = "Bearer sk-test"
+            msg_pl = {
+                "model": model,
+                "system": STRUCTURED_COT_CANARY_SYSTEM_PROMPT,
+                "messages": [{"role": "user", "content": "What is 17 * 23? Answer briefly."}],
+                "max_tokens": 1024,
+                "thinking": {"type": "enabled", "budget_tokens": 512, "display": "summarized"},
+            }
+            async with asyncio.timeout(min(timeout, 12.0)):
+                async with session.post(
+                    f"{base.rstrip('/')}/v1/messages",
+                    headers=msg_hdrs,
+                    json=msg_pl,
+                    timeout=aiohttp.ClientTimeout(total=min(timeout, 12.0), connect=CONNECT_TIMEOUT),
+                ) as rm:
+                    if rm.status == 200:
+                        raw_m = await rm.json(content_type=None)
+                        if isinstance(raw_m, dict) and (raw_m.get("type") == "message" or isinstance(raw_m.get("content"), list)):
+                            m_ret = str(raw_m.get("model") or "").strip()
+                            if m_ret and _detect_tier_or_version_downgrade(model, m_ret):
+                                checks["messages_truth_downgrade"] = m_ret
+                                return {"model": model, "score": 0, "tier": "FAKE_MODEL_SPOOF", "checks": checks}
+                            m_sig = ""
+                            m_reas_parts, m_txt_parts = [], []
+                            for blk in (raw_m.get("content") or []):
+                                if isinstance(blk, dict):
+                                    if blk.get("type") in ("thinking", "redacted_thinking"):
+                                        if blk.get("signature") and not m_sig:
+                                            m_sig = str(blk["signature"])
+                                        if blk.get("thinking"):
+                                            m_reas_parts.append(str(blk["thinking"]))
+                                    elif blk.get("type") == "text" and blk.get("text"):
+                                        m_txt_parts.append(str(blk["text"]))
+                            if m_sig:
+                                _sp_sig, _rsn_sig, _ = verify_anthropic_messages_signature(
+                                    m_sig, str(raw_m.get("id") or ""), model
+                                )
+                                if _sp_sig:
+                                    checks["messages_signature_spoof"] = _rsn_sig
+                                    return {"model": model, "score": 0, "tier": "FAKE_MODEL_SPOOF", "checks": checks}
+                            _sp_cot, _rsn_cot = check_structured_cot_canary_obedience(
+                                "\n".join(m_reas_parts), "\n".join(m_txt_parts), model
+                            )
+                            if _sp_cot:
+                                checks["messages_cot_spoof"] = _rsn_cot
+                                return {"model": model, "score": 0, "tier": "FAKE_MODEL_SPOOF", "checks": checks}
+                    elif rm.status in (404, 405):
+                        cot_extra = dict(extra_payload or {})
+                        cot_extra["messages"] = [
+                            {"role": "system", "content": STRUCTURED_COT_CANARY_SYSTEM_PROMPT},
+                            {"role": "user", "content": "Write 2 sentences about a rain-slicked Tokyo rooftop at midnight."},
+                        ]
+                        cot_extra["reasoning_effort"] = "high"
+                        cot_extra["thinking"] = {"type": "enabled", "budget_tokens": 1024}
+                        rc_cot = await chat(
+                            session,
+                            base,
+                            chat_path,
+                            model,
+                            "Write 2 sentences about a rain-slicked Tokyo rooftop at midnight.",
+                            min(timeout, 12.0),
+                            max_tokens=220,
+                            headers=headers,
+                            extra_payload=cot_extra,
+                        )
+                        if rc_cot.get("status") == 200:
+                            _sp_cot2, _rsn_cot2 = check_structured_cot_canary_obedience(
+                                str((rc_cot.get("raw_msg") or {}).get("reasoning_content") or ""),
+                                _visible_text(rc_cot),
+                                model,
+                            )
+                            if _sp_cot2:
+                                checks["chat_cot_spoof"] = _rsn_cot2
+                                return {"model": model, "score": 0, "tier": "FAKE_MODEL_SPOOF", "checks": checks}
+        except Exception:
+            pass
 
     tier = "GOLD" if score >= 9 else "SILVER" if score >= 6 else "BRONZE" if score >= 3 else "FAKE"
     return {"model": model, "score": score, "tier": tier, "checks": checks}
