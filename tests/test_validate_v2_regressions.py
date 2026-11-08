@@ -318,4 +318,43 @@ def test_multi_format_completion_extraction_and_endpoint_fallback():
     assert sse_a["resp_model"] == "claude-sonnet-4-6"
 
 
+def test_validate_v2_anthropic_signature_and_cot_canary():
+    """Verify validate_v2's /v1/messages signature protobuf verifier and structured CoT canary."""
+    import base64
+
+    # 1. 36-byte UUID signature is rejected
+    sp1, rsn1, _ = v.verify_anthropic_messages_signature(
+        "5ad849df-ccb2-4c3b-8f94-bb5fe39c6853",
+        "5ad849df-ccb2-4c3b-8f94-bb5fe39c6853",
+        "claude-sonnet-4-6",
+    )
+    assert sp1 is True
+    assert "fake_thinking_signature" in rsn1
+
+    # 2. Downgraded protobuf model inside signature is rejected
+    fake_pb = b"\x12\x40padding_claude-haiku-4-5-202510018\x00thinkingZ$a85a29f8" + (b"\x9a" * 180)
+    sig_h = base64.b64encode(fake_pb).decode("ascii")
+    sp2, rsn2, pb2 = v.verify_anthropic_messages_signature(sig_h, "msg_1", "claude-opus-4-8")
+    assert sp2 is True
+    assert "signature_protobuf_downgrade" in rsn2
+
+    # 3. Structured CoT canary & telegraphic Qwen3.8 CoT on Claude
+    sp3, rsn3 = v.check_structured_cot_canary_obedience(
+        "[GATE 1: SCENE_PARSE]\nSubject: detective.\n[PHASE 2: TONE_MATRIX]\nNoir.",
+        "Rain fell.",
+        "claude-opus-4-8",
+    )
+    assert sp3 is True
+    assert "fake_cot_obedience" in rsn3
+
+    sp4, rsn4 = v.check_structured_cot_canary_obedience(
+        "We need answer briefly. 17*23=391. Need final only.",
+        "391",
+        "claude-sonnet-4-6",
+    )
+    assert sp4 is True
+    assert "telegraphic_qwen_cot" in rsn4
+
+
+
 
