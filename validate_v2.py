@@ -574,6 +574,8 @@ def is_chat_model(m_name: str) -> bool:
 def _build_completion_request(chat_path: str, model: str, prompt: str, max_tokens: int, stream: bool, headers: dict | None, extra_payload: dict | None):
     """Build (payload, req_headers) tailored to the target completion endpoint kind."""
     req_headers = dict(headers) if isinstance(headers, dict) else {}
+    req_headers.setdefault("x-bf-mcp-include-clients", "none")
+    req_headers.setdefault("x-bf-mcp-include-tools", "none")
     cp = (chat_path or "/v1/chat/completions").rstrip("/")
     if cp.endswith("/messages"):
         # Anthropic /v1/messages native format
@@ -1435,6 +1437,26 @@ async def probe_path_fast(session, base, m_path, c_path, headers=None):
                         elif m_path == "/model/info":
                             m_list.extend([str(k) for k in data.keys() if k != "data"])
                     if m_list:
+                        # If /v1/models has Bifrost-style provider/model IDs, also check /api/keys for unlisted provider models
+                        if m_path == "/v1/models" and any("/" in x for x in m_list):
+                            try:
+                                async with session.get(
+                                    f"{base}/api/keys",
+                                    headers=headers,
+                                    timeout=aiohttp.ClientTimeout(total=2.0, connect=CONNECT_TIMEOUT),
+                                ) as rk:
+                                    if rk.status == 200:
+                                        kdata = await rk.json(content_type=None)
+                                        if isinstance(kdata, list):
+                                            for kitem in kdata:
+                                                if isinstance(kitem, dict) and kitem.get("provider") and isinstance(kitem.get("models"), list):
+                                                    prov = str(kitem["provider"]).strip()
+                                                    for km in kitem["models"]:
+                                                        if km:
+                                                            km_s = str(km).strip()
+                                                            m_list.append(km_s if "/" in km_s else f"{prov}/{km_s}")
+                            except Exception:
+                                pass
                         return (m_path, c_path, list(dict.fromkeys(m_list)))
                     if (
                         isinstance(data, dict)
