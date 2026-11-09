@@ -80,8 +80,27 @@ FRONTIER_PRIORITY_PREFIXES = (
     "deepseek-v4.1", "deepseek-v4", "deepseek-r1",
     "kimi-k3", "kimi-k2.6", "kimi-k2",
     "glm-5.3", "glm-5.2", "glm-5",
-    "grok-4", "minimax-m3", "qwen3.8", "qwen3.6", "qwen3-235b", "qwen3-coder",
+    "grok-4", "minimax-m3", "nemotron-3-ultra", "step-5", "qwen3.8", "qwen3.6", "qwen3-235b", "qwen3-coder",
 )
+
+WILDCARD_MODEL_EXPANSIONS = {
+    "nvidia_nim/*": [
+        "nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b",
+        "nvidia_nim/stepfun-ai/step-5-preview",
+        "nvidia_nim/minimaxai/minimax-m3.1-flash",
+        "nvidia_nim/z-ai/glm-5.3-flash",
+        "nvidia_nim/deepseek-ai/deepseek-v4.1-flash",
+    ],
+    "openrouter/*": [
+        "openrouter/anthropic/claude-opus-4-6",
+        "openrouter/anthropic/claude-sonnet-4-6",
+        "openrouter/openai/gpt-5",
+        "openrouter/deepseek/deepseek-r1",
+    ],
+    "anthropic/*": ["anthropic/claude-opus-4-6", "anthropic/claude-sonnet-4-6"],
+    "openai/*": ["openai/gpt-5", "openai/gpt-4o"],
+    "deepseek/*": ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash", "deepseek/deepseek-chat"],
+}
 
 SMALL_LOCAL_SPOOF_FAMILIES = (
     "llama3:8b", "llama-3-8b", "llama3.2:1b", "llama3.2:3b", "qwen2:0.5b",
@@ -1443,6 +1462,16 @@ async def probe_path_fast(session, base, m_path, c_path, headers=None):
                         elif m_path == "/model/info":
                             m_list.extend([str(k) for k in data.keys() if k != "data"])
                     if m_list:
+                        expanded_m = []
+                        for xm in m_list:
+                            if xm in WILDCARD_MODEL_EXPANSIONS:
+                                expanded_m.extend(WILDCARD_MODEL_EXPANSIONS[xm])
+                            elif xm.endswith("/*"):
+                                pfx = xm[:-1]
+                                expanded_m.extend([f"{pfx}claude-opus-4-6", f"{pfx}gpt-5", f"{pfx}deepseek-v4-flash"])
+                            else:
+                                expanded_m.append(xm)
+                        m_list = expanded_m
                         # If /v1/models has Bifrost-style provider/model IDs, also check /api/keys for unlisted provider models
                         if m_path == "/v1/models" and any("/" in x for x in m_list):
                             try:
@@ -1461,6 +1490,24 @@ async def probe_path_fast(session, base, m_path, c_path, headers=None):
                                                         if km:
                                                             km_s = str(km).strip()
                                                             m_list.append(km_s if "/" in km_s else f"{prov}/{km_s}")
+                            except Exception:
+                                pass
+                        # If /api/models succeeded, check /api/keys/ for LLM API Monitor unmasked key + /api/proxy/v1/chat/completions
+                        if m_path == "/api/models":
+                            try:
+                                async with session.get(
+                                    f"{base}/api/keys/",
+                                    headers=headers,
+                                    timeout=aiohttp.ClientTimeout(total=2.0, connect=CONNECT_TIMEOUT),
+                                ) as rk2:
+                                    if rk2.status == 200:
+                                        k2 = await rk2.json(content_type=None)
+                                        if isinstance(k2, list):
+                                            for kitem in k2:
+                                                if isinstance(kitem, dict) and kitem.get("is_active") and kitem.get("api_key"):
+                                                    ak = str(kitem["api_key"]).strip()
+                                                    if len(ak) >= 20 and "..." not in ak and "*" not in ak:
+                                                        return (m_path, "/api/proxy/v1/chat/completions", list(dict.fromkeys(m_list)), {"Authorization": f"Bearer {ak}"})
                             except Exception:
                                 pass
                         return (m_path, c_path, list(dict.fromkeys(m_list)))
@@ -2077,6 +2124,7 @@ async def validate_host(session, host, timeout, max_models, sem, ledger_fp=None,
             "port": port,
             "endpoint_path": discovered_path,
             "chat_path": active_host_chat[0],
+            "auth_header": (auth_headers or {}).get("Authorization"),
             "tier": host_tier,
             "total_models": len(raw_models),
             "tested_models_count": len(results),
