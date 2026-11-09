@@ -72,10 +72,15 @@ UNLISTED_CANARY_MODELS = (
 )
 
 FRONTIER_PRIORITY_PREFIXES = (
-    "[按量", "按量ccmax", "小e-", "单间-", "claude-opus", "claude-sonnet", "claude-haiku", "claude-fable",
-    "anthropic.claude", "us.openai.gpt-6", "gpt-6", "gpt-5", "o3", "o4",
-    "gemini-2.5-pro", "gemini-3", "gemini-4", "deepseek-v4", "deepseek-r1", "kimi-k2",
-    "kimi-k3", "glm-5", "grok-4", "qwen3-235b", "qwen3-coder", "qwen3.8",
+    "[按量", "按量ccmax", "小e-", "单间-",
+    "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus",
+    "claude-sonnet-5", "claude-sonnet-4-6", "claude-sonnet", "claude-haiku", "claude-fable",
+    "anthropic.claude", "us.openai.gpt-6", "gpt-6.1", "gpt-6", "gpt-5.6", "gpt-5.5", "codex-auto", "gpt-5", "o3", "o4",
+    "gemini-4", "gemini-3.5", "gemini-3.1", "gemini-3", "gemini-2.5-pro",
+    "deepseek-v4.1", "deepseek-v4", "deepseek-r1",
+    "kimi-k3", "kimi-k2.6", "kimi-k2",
+    "glm-5.3", "glm-5.2", "glm-5",
+    "grok-4", "minimax-m3", "qwen3.8", "qwen3.6", "qwen3-235b", "qwen3-coder",
 )
 
 SMALL_LOCAL_SPOOF_FAMILIES = (
@@ -86,13 +91,14 @@ SMALL_LOCAL_SPOOF_FAMILIES = (
 
 
 def sort_models_by_priority(models: list[str]) -> list[str]:
-    """Place Tea-channel prefixes and frontier models first so host budget is spent on high-value models."""
-    def _rank(m: str) -> tuple[int, str]:
+    """Place Tea-channel prefixes and newest frontier models first, deferring dated snapshot duplicates."""
+    def _rank(m: str) -> tuple[int, int, str]:
         low = m.lower()
+        is_dated = 1 if ("-2024-" in low or "-2025-" in low or "-2026-" in low) else 0
         for idx, pref in enumerate(FRONTIER_PRIORITY_PREFIXES):
             if pref in low:
-                return (idx, m)
-        return (len(FRONTIER_PRIORITY_PREFIXES) + 1, m)
+                return (idx, is_dated, m)
+        return (len(FRONTIER_PRIORITY_PREFIXES) + 1, is_dated, m)
     return sorted(models, key=_rank)
 
 NON_CHAT_KEYWORDS = [
